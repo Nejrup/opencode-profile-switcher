@@ -1,273 +1,248 @@
 # opencode-profile-switcher
 
-Apply an OpenCode profile from `<config>/profiles/<name>/` live — no config file
-is edited and no restart is needed for the parts a plugin can reach.
+**Switch OpenCode config profiles from inside the TUI — no config edits, no restart.**
 
-Two halves ship from one package: `src/index.ts` runs on the server and applies
-the overlay through transforms, `src/tui.tsx` adds the picker and badge. The
-package exposes both entrypoints under `exports` (`"."` and `"./tui"`), which is
-how the server and the CLI each find their half.
+Keep one directory per setup you work in — a cheap-and-fast one, a research one
+with different agents, a locked-down one for production repos — and flip between
+them with `<leader>p` while a session is running.
+
+```text
+schematic — picker and footer badge, not a screenshot
+
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   Profile
+  ─────────────────────────────────────────────────
+    active  base config        No profile overlay
+            fast               gpt-5-nano route · ⚠ 2 legacy fields ignored
+            review-only        edit denied · 3 agents
+    ▸       deep               architect + explorer · relaunch for: compaction
+  ─────────────────────────────────────────────────
+   build · deep · 128k/32k ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+                                  footer: ▔▔▔ deep ▔▔▔
+```
+
+| | |
+| --- | --- |
+| **Applies live** | default agent, per-agent models, agent `.md` definitions, default model, MCP servers, permission rules, per-agent generation tuning |
+| **Reports** | which fields need a relaunch, which are V1-but-normalized, which V2 ignores — each with the fix |
+| **Writes** | nothing in your config; only the picker's own handoff file |
+
+OpenCode **2.x** only (V1 has no plugin API for this). Released under MIT.
+
+---
 
 ## Install
 
-Needs OpenCode V2. The package exposes two entrypoints (`.` for the server, `./tui`
-for the terminal), and the two halves are configured separately: the server reads
-`plugins` in `opencode.json(c)`, the terminal client reads `plugins` in
-`~/.config/opencode/cli.json`. `opencode plugin add` only writes the server list,
-so do both:
+Two edits and a restart, because the package has two halves: the **server** reads
+`plugins` in `opencode.json(c)`, the **terminal** reads `plugins` in
+`~/.config/opencode/cli.json`, and `plugin add` only writes the first.
 
 ```sh
+# 1. server half
 opencode plugin add github:Nejrup/opencode-profile-switcher
 ```
 
-```jsonc title="~/.config/opencode/cli.json"
+```jsonc
+// 2. terminal half — ~/.config/opencode/cli.json
 {
-  "plugins": ["github:Nejrup/opencode-profile-switcher"]
+  "plugins": ["github:Nejrup/opencode-profile-switcher"],
 }
 ```
 
-Then restart the service once so it re-reads both lists:
-
 ```sh
+# 3. let both lists land
 opencode service restart
 ```
 
-Pin a release by appending a ref (`github:Nejrup/opencode-profile-switcher#v1.0.0`).
-An unpinned `github:` spec tracks the default branch and is refreshed by
-`opencode plugin update`; exact versions and full commit hashes stay pinned and
-are skipped.
-
-Verify:
+Check it took:
 
 ```sh
-opencode plugin list          # profile-switcher listed
-opencode api get /api/plugin  # server: status active, features: server + tui
+opencode plugin list
+# ID                VERSION  SOURCE
+# profile-switcher  b311994  github:Nejrup/opencode-profile-switcher
 ```
 
-Open the TUI → `/plugins` → the plugin is listed (TUI section) without a failure
-marker; `<leader>p` opens the picker and the footer shows the active profile.
+Open the TUI, press `<leader>p` (leader defaults to `ctrl+x`, so `ctrl+x` then
+`p`), and the picker should list whatever is under `~/.config/opencode/profiles/`.
 
-### Develop against a local checkout
+> **Pin a version:** append a ref — `github:Nejrup/opencode-profile-switcher#v1.1.0`.
+> An unpinned spec tracks the default branch and `opencode plugin update` moves it;
+> exact versions and full commit hashes stay put and are skipped by update checks.
 
-`install.sh` registers this directory with `git+file://` (a git clone of HEAD, the
-fully local equivalent of a published install) and appends the same spec to
-`cli.json`, so you can iterate without pushing:
+## Make a profile
 
-```sh
-/path/to/opencode-profile-switcher/install.sh
-opencode service restart
+A profile is a directory with a config in it:
+
+```text
+~/.config/opencode/profiles/
+└── deep/
+    ├── opencode.jsonc        ← the overlay
+    ├── profile.jsonc         ← optional picker label/description
+    └── agents/
+        ├── architect.md      ← agent definitions, loaded live
+        └── explorer.md
 ```
 
-The dev loop after that:
-
-```sh
-git add -A && git commit        # git+file installs HEAD
-opencode plugin update         # refresh the installed package
-opencode service restart       # reload configs (new plugin list for TUI)
+```jsonc title="~/.config/opencode/profiles/deep/opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "architect",
+  "model": "anthropic/claude-opus-4-7",
+  "agents": {
+    "architect": { "model": "anthropic/claude-opus-4-7" },
+    "explorer": { "model": "anthropic/claude-haiku-4-5", "mode": "subagent" },
+    "build": { "disabled": true },
+  },
+  "permissions": [
+    { "action": "edit", "resource": "**", "effect": "deny" },
+    { "action": "shell", "resource": "git push *", "effect": "ask" },
+  ],
+  "mcp": {
+    "servers": {
+      "docs": { "type": "remote", "url": "https://mcp.example.com" },
+    },
+  },
+}
 ```
 
-If `plugin update` doesn't refresh (no version bump), drop and re-add:
-
-```sh
-opencode plugin remove "git+file://$PWD" && rm -rf ~/.cache/opencode/npm/git-profile-switcher-* 
-opencode plugin add "git+file://$PWD"
+```jsonc title="~/.config/opencode/profiles/deep/profile.jsonc"
+{ "label": "deep", "description": "architect + explorer, edits denied", "hidden": false }
 ```
 
-Back to the published spec afterwards: `opencode plugin remove` the `git+file://`
-entry from both lists and re-run the install above.
-
-### Uninstall
-
-```sh
-opencode plugin remove github:Nejrup/opencode-profile-switcher
-# 2.0.3 removes the spec from opencode.jsonc and cli.json; check cli.json either way
-```
-
-### Why a package spec, not a path
-
-The terminal client discards plain `./path` and `file://` entries in `cli.json`
-and resolves only npm / git package specs, and the TUI half is never discovered
-from the global `plugins/` directory (that directory is a server-only fallback,
-and its files are treated as server-only plugins). Both halves therefore need the
-same package spec.
+`profile.jsonc` is cosmetic — drop it and the picker derives a summary from
+`default_agent` and `model`. Agent names in `agents` that have no `.md` file
+still get created, just without a prompt.
 
 ## Use
 
 | How | What |
 | --- | --- |
-| `<leader>p` | Picker. The leader key defaults to `ctrl+x`, so this is `ctrl+x` then `p`. |
+| `<leader>p` | Picker (`ctrl+x` then `p` by default) |
 | Command palette | "Switch profile" |
 | `/profile` | Applied profile, plus the full list |
-| `/profile <name>` | Apply a profile |
-| `/profile none` | Return to base config |
+| `/profile <name>` | Apply a profile — matches name or label, case-insensitive |
+| `/profile none` | Back to base config |
 | `/profile prev` | Back to the previously applied profile |
 
-The footer status area shows the active profile name, and is blank when no
-profile is applied.
+The footer shows the active profile name and is blank on base config. The choice
+is persisted to `<config>/.profile-switcher.json`, so it survives restarts, and
+both halves watch that file — switching from the picker or from `/profile` stays
+in sync either way.
 
-The selection is stored in `<config>/.profile-switcher.json`, so it survives
-restarts. Both halves watch that file, so switching from the picker or from
-`/profile` stays in sync either way.
+## What changes take effect
 
-## What a profile is
-
-Any directory under `<config>/profiles/<name>/` holding an `opencode.jsonc`.
-Agents are read from `<profile>/agents/*.md` and `<profile>/.opencode/agents/*.md`.
-
-An optional `<profile>/profile.jsonc` only affects how the profile is labelled in
-the picker; delete it to fall back to a derived summary:
-
-```jsonc
-{ "label": "Qwen 3.8 stack", "description": "short note", "hidden": false }
-```
-
-## What applies live
-
-| Config | How |
+| Profile key | Applied live through |
 | --- | --- |
-| `agents` | `agent.transform`: `disabled` → hidden, `model` → override |
+| `agents` | `agent.transform` — `disabled` → hidden, `model` → override |
 | `agents/*.md` | upserted as agents; the previous profile's are hidden again |
 | `default_agent` | `agent.transform` → `draft.default()` |
 | `model` | `catalog.transform` → `model.default.set()` |
 | `mcp.servers` | `mcp.transform` → `editor.set()` |
-| `permissions` | `permission.hook("evaluate")` per decision |
+| `permissions` | `permission.hook("evaluate")`, last-match-wins |
 | agent `temperature` / `reasoningEffort` / `textVerbosity` | `session.hook("context")` writing `event.options` |
 
-Disabled agents are **hidden, never removed**: a session still bound to a removed
-agent dies with `Session.AgentNotFoundError` on its next turn. The same applies to
-agents a previous profile created.
+Two deliberate choices behind that:
 
-`mcp.servers` entries are normalised before being applied: a V1 `enabled: false`
-becomes `disabled: true`, and a missing `type` is inferred from `command` / `url`.
-Anything still structurally invalid is skipped rather than pushed at the editor.
+- **Agents are hidden, never removed.** A session still bound to a removed agent
+  dies with `Session.AgentNotFoundError` on its next turn, so anything a profile
+  retires just leaves the picker.
+- **The session you are in gets moved.** Applying a profile switches the current
+  session onto the profile's default agent and model, and the terminal's own
+  caches are re-synced so it's visible without a relaunch.
 
-V2 has no agent-level `temperature` / `reasoningEffort` / `textVerbosity` fields
-([agents guide](https://opencode.ai/v2/docs/agents)), so per-agent tuning is read
-from the agent's `.md` frontmatter and applied per model request through the
-context hook's `options`: typed keys are generation settings, and any other key is
-passed to the selected protocol as a provider option. `temperature` is always
-applied; `reasoningEffort` / `textVerbosity` are OpenAI request options, so that
-hook is registered with `{ providerID: "openai" }` instead of being filtered by
-hand.
+<details>
+<summary><b>Needs a relaunch instead</b> (the picker and <code>/profile</code> tell you which)</summary>
 
-Agent markdown frontmatter is read for `description`, `mode`, `model`,
-`temperature`, `reasoningEffort`, `textVerbosity`, and the body becomes the
-system prompt. An unrecognised `mode` is ignored rather than cast. Nested
-frontmatter such as a per-agent `permissions:` tree is not applied by the
-switcher; the profile's top-level `permissions` array is enforced instead.
-
-## Switch-time field lint
-
-At every switch (and in `/profile <name>`), the profile config is classified so
-nothing is silently applied or silently dropped:
-
-- **applied live** — keys handled by the transforms above
-- **relaunch to apply** — valid V2 keys with no runtime transform; the exact
-  `opencode <dir>` command is printed
-- **V1 but normalized by V2** — `autoupdate`, `small_model`,
-  `enabled_providers`, `disabled_providers`: OpenCode still honours them, each
-  with its native form shown
-- **legacy fields** — V1 keys V2 ignores, each with the fix
-- **unrecognized** — keys that match no known V2 field
-
-The legacy list covers the containers too, so nested damage is reported:
-`agent`/`mode` → `agents`, `plugin` → `plugins`, `permission` map and `tools` →
-`permissions`, `provider` → `providers` (with `npm` → `package`, `api`/`options` →
-`settings`), `command` → `commands`, `reference` → `references`, `autoshare` →
-`share`, `snapshot` → `snapshots`, `attachment` → `media`, `skills` as an object →
-array, `mcp` servers not nested under `servers`, top-level `subagent_depth` →
-`experimental.subagent_depth`, `logLevel` → `OPENCODE_LOG_LEVEL`, plus
-`experimental.*`, `compaction.*` and per-agent members
-(`disable`, `prompt`, `variant`, `maxSteps`, `temperature`, `options`, `name`, …).
-
-The native key set is the `Config.InfoEncoded` contract the server itself serves
-(`opencode api get /openapi.json`), which is 28 keys; `https://opencode.ai/config.json`
-still describes the V1 shape, so it is not a usable reference for this.
-
-The TUI picker shows a `⚠ N legacy fields ignored` marker on affected profiles and
-lists normalized V1 keys in the detail line.
-
-## Known limitations
-
-- Profiles are read in **native V2 shapes only**; a V1 `agent` map contributes no
-  agent models or disabled list, and is reported instead of translated. Add the
-  `.md` files or rename the key.
-- The permission hook runs **after** the configured ruleset, and an explicit
-  configured `deny` is final — so a profile can tighten or re-route a decision but
-  can never widen what `opencode.json(c)` already blocks.
-- `permissions` rules match `action` and `resource` globs with last-match-wins
-  precedence, mirroring OpenCode's own ruleset, but resource *semantics* (which
-  path a tool reports) are OpenCode core's, not this plugin's.
-- Session migration on switch sets the agent and model only; anything else the
-  profile changes mid-turn stays until the next request.
-
-## What still needs a relaunch
-
-Everything else in the V2 key list has no plugin transform: `plugins`,
+Everything else in the V2 key list has no runtime transform: `plugins`,
 `experimental`, `compaction`, `providers`, `lsp`, `formatter`, `instructions`,
-`skills`, `commands`, `references`, `watcher`, `media`, `tool_output`, `snapshots`,
-`worktree`, `warming`, `websearch`, `update`, `share`, `enterprise`, `username`,
-`shell`. The picker and `/profile` list which of these a profile sets, and print
-the exact command:
+`skills`, `commands`, `references`, `watcher`, `media`, `tool_output`,
+`snapshots`, `worktree`, `warming`, `websearch`, `update`, `share`, `enterprise`,
+`username`, `shell`. Relaunch in the profile directory to apply those:
 
 ```sh
-opencode ~/.config/opencode/profiles/perf
+opencode ~/.config/opencode/profiles/deep
 ```
 
-## Notes on behaviour
+</details>
 
-- Transforms run after global and project config are merged, so the overlay
-  sits above them. Only managed config outranks it.
-- Applying a profile that hides `build` while a session is running `build`
-  removes that agent from future requests.
-- A profile whose `agents/*.md` files are missing still upserts the names found
-  in its `agents` config, but those have no prompt. The picker marks how many
-  agents are new, and `/profile <name>` lists which were loaded.
-- Unreadable profiles are skipped rather than failing the load.
+## It tells you when a profile is stale
+
+Switching never silently drops a field. Every switch classifies the profile
+config into five buckets, and `/profile <name>` prints the breakdown:
+
+```text
+**deep** — `/Users/you/.config/opencode/profiles/deep`
+- default agent: `architect`
+- applied live: agents, default_agent, mcp, model, permissions
+- relaunch to apply: compaction — `opencode .../profiles/deep`
+- V1 but normalized by V2:
+    - autoupdate — native form: "update": "disable" | "notify" | "auto"
+- legacy fields (ignored by V2):
+    - agent — rename to "agents"
+    - permission — rename to "permissions" (array of { action, resource, effect })
+    - experimental.batch_tool — no V2 equivalent — ignored
+```
+
+| Bucket | Means |
+| --- | --- |
+| **applied live** | handled by the transforms above |
+| **relaunch to apply** | valid V2, no runtime transform |
+| **V1 but normalized** | OpenCode still honours it (`autoupdate`, `small_model`, `enabled_providers`, `disabled_providers`) |
+| **legacy fields** | V2 ignores it, and the fix is printed |
+| **unrecognized** | matches no known V2 field, probably a typo |
+
+Nested damage is caught too — `providers.acme.npm`, `compaction.prune`,
+`experimental.continue_loop_on_deny`, `agents.*.disable`, `mcp` servers not under
+`servers`, `skills` as an object. The native key set comes from the contract the
+server itself serves (`opencode api get /openapi.json` → `Config.InfoEncoded`),
+not from `https://opencode.ai/config.json`, which still describes V1.
+
+Profiles are read in **native V2 shapes only** — the switcher reports V1 keys
+rather than guessing at a translation.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| No `<leader>p`, no "Switch profile" in the palette | terminal half missing | add the spec to `~/.config/opencode/cli.json` `plugins`, then `opencode service restart` |
+| Listed in `plugin list` but no `/profile` command | server half not loaded yet | `opencode api get /api/plugin` → `state` should be `active`; restart the service |
+| `/plugins` shows a failure marker on it | resolved a bad copy, or you edited a local install | `opencode plugin update`; if it sticks, `rm -rf ~/.cache/opencode/npm/git-*profile-switcher-*` and re-add |
+| Applied a profile but agents/models did not change | profile uses V1 `agent:` / `permission:` keys | rename to `agents` / `permissions` — the switch report lists exactly which |
+| Agents appear with no prompt | `agents/<name>.md` missing or unreadable | add the file; the picker counts how many agents were loaded |
+| Profile changes a `plugins` or `compaction` key and nothing happens | those are startup-only | relaunch: `opencode <profile dir>` |
+| Two OpenCode windows disagree | the handoff file is global, one switch wakes every loaded location | intentional today; see [Limits](#known-limits) |
+
+## Known limits
+
+- **The overlay is global, not per-location.** The handoff file is one file in the
+  config dir, so a switch applies to every location the service has loaded; only
+  session migration is ownership-checked.
+- **A profile can tighten permissions but never loosen them.** The `evaluate` hook
+  runs after the configured ruleset, and an explicit configured `deny` is final.
+- **Resource semantics belong to core.** Rules match `action` and `resource` globs
+  with last-match-wins, exactly like OpenCode's own ruleset, but which path a tool
+  reports as its resource is core's business.
+- **Mid-turn changes wait for the next request.** Switching moves the session's
+  agent and model immediately; other effects land on the next model call.
 
 ## Development
 
 ```sh
 bun install
-bun run typecheck   # tsc --noEmit against @opencode/plugin 2.x types
-bun test            # bun test, pure logic: refs, permissions, field lint
+bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.x types
+bun test            # 24 tests: refs, permission precedence, field lint, frontmatter
 ```
 
-## Implementation notes
+Iterate without pushing: `./install.sh` registers this checkout with
+`git+file://` in both plugin lists, then the loop is
+`git commit` → `opencode plugin update` → `opencode service restart`.
 
-`keymap.layer()` is registered from a component body rather than from `setup()`.
-It resolves the Keymap provider through the current owner tree, and `setup()` is
-called after an `await` in the loader, so calling it there throws
-`Keymap.Provider is missing`.
+Release: bump `version`, tag, push, `gh release create`, and an unpinned install
+picks it up with `opencode plugin update`.
 
-Both halves use `Plugin.define()` per the V2 docs (`@opencode/plugin` for the
-server, `@opencode/plugin/tui` for the CLI). The server entry is
-`{ id, setup }`; the TUI entry is `{ id, setup }` with the required
-`/** @jsxImportSource @opentui/solid */` pragma so the host's JSX transform
-compiles the badge/picker markup.
+Contributor notes — the plugin contract gotchas, where each behaviour lives, and
+how to test against a live server — are in [AGENTS.md](./AGENTS.md).
 
-`draft.update()` in `agent.transform` creates an agent when the id is unknown
-rather than ignoring it — verified against a running server. That is what makes
-live agent loading possible, and it is also why an unknown name is never passed
-to it: doing so would produce a prompt-less stub.
+## License
 
-Things the 2.0.3 contract checks caught, worth knowing when you touch this:
-
-- The context hook's request overrides live on `event.options`. There is no
-  `event.generation` and no `event.providerOptions`; writing to those throws
-  inside every model request for the affected agent. Provider options are just
-  untyped keys on `options`, and `hook(name, callback, { providerID })` scopes
-  them properly.
-- `Agent.Info.name`, `Model.Ref.id` and `Model.Ref.providerID` are effect brands.
-  Build refs with `Model.Ref.parse("provider/model#variant")` (it throws on
-  garbage) and names with `Agent.Name.make(...)`; a plain `{ providerID, id }`
-  literal does not typecheck.
-- `Agent.Info` has no `native` field (`id`, `name`, `model?`, `request`,
-  `description?`, `mode`, `hidden`, `color?`, `steps?`, `permissions`). Guarding
-  on a field that never existed silently disabled the check.
-- Registration disposal is `Promise<void> | void`, so `registration.dispose().catch()`
-  is a type error; await it inside a try/catch.
-- A `Session.Info` carries `agent`, `model` and `location.directory`, which is how
-  `migrateSession` decides whether *this* location owns the session — the handoff
-  file is global, so without that check one switch would migrate the session once
-  per loaded location.
+MIT — see [LICENSE](./LICENSE).
