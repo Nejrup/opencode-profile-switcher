@@ -160,6 +160,7 @@ export default Plugin.define({
       const notes: string[] = []
       if (w.legacy.length) notes.push(`⚠ ${w.legacy.length} legacy field${w.legacy.length === 1 ? "" : "s"} ignored`)
       if (w.unknown.length) notes.push(`⚠ ${w.unknown.length} unrecognized`)
+      if (w.adapted.length) notes.push(`${w.adapted.length} V1 key${w.adapted.length === 1 ? "" : "s"} normalized`)
       if (profile.agents.length) notes.push(`${profile.agents.length} agents`)
       if (w.relaunch.length) notes.push(`relaunch for: ${w.relaunch.join(", ")}`)
       return notes.length ? `${profile.description} · ${notes.join(" · ")}` : profile.description

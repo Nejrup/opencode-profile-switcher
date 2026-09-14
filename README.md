@@ -125,25 +125,36 @@ the picker; delete it to fall back to a derived summary:
 
 | Config | How |
 | --- | --- |
-| `agents` | `agent.transform`: `disabled` → remove, `model` → override |
-| `agents/*.md` | upserted as agents; previous profile's are removed |
+| `agents` | `agent.transform`: `disabled` → hidden, `model` → override |
+| `agents/*.md` | upserted as agents; the previous profile's are hidden again |
 | `default_agent` | `agent.transform` → `draft.default()` |
 | `model` | `catalog.transform` → `model.default.set()` |
-| `mcp.servers` | `mcp.transform` → `draft.set()` |
+| `mcp.servers` | `mcp.transform` → `editor.set()` |
 | `permissions` | `permission.hook("evaluate")` per decision |
-| agent `temperature` / `reasoningEffort` / `textVerbosity` | `session.hook("context")` per `event.agent` |
+| agent `temperature` / `reasoningEffort` / `textVerbosity` | `session.hook("context")` writing `event.options` |
+
+Disabled agents are **hidden, never removed**: a session still bound to a removed
+agent dies with `Session.AgentNotFoundError` on its next turn. The same applies to
+agents a previous profile created.
+
+`mcp.servers` entries are normalised before being applied: a V1 `enabled: false`
+becomes `disabled: true`, and a missing `type` is inferred from `command` / `url`.
+Anything still structurally invalid is skipped rather than pushed at the editor.
 
 V2 has no agent-level `temperature` / `reasoningEffort` / `textVerbosity` fields
-(opencode.ai/v2/docs/agents), so per-agent tuning is read from the agent's `.md`
-frontmatter and applied at request time through the context hook. `temperature`
-is always applied; `reasoningEffort` / `textVerbosity` are OpenAI request options
-and are only sent when the selected provider is `openai`.
+([agents guide](https://opencode.ai/v2/docs/agents)), so per-agent tuning is read
+from the agent's `.md` frontmatter and applied per model request through the
+context hook's `options`: typed keys are generation settings, and any other key is
+passed to the selected protocol as a provider option. `temperature` is always
+applied; `reasoningEffort` / `textVerbosity` are OpenAI request options, so that
+hook is registered with `{ providerID: "openai" }` instead of being filtered by
+hand.
 
 Agent markdown frontmatter is read for `description`, `mode`, `model`,
 `temperature`, `reasoningEffort`, `textVerbosity`, and the body becomes the
-system prompt. Nested frontmatter such as a per-agent `permissions:` tree is not
-applied by the switcher; the profile's top-level `permissions` array is enforced
-instead.
+system prompt. An unrecognised `mode` is ignored rather than cast. Nested
+frontmatter such as a per-agent `permissions:` tree is not applied by the
+switcher; the profile's top-level `permissions` array is enforced instead.
 
 ## Switch-time field lint
 
@@ -151,24 +162,53 @@ At every switch (and in `/profile <name>`), the profile config is classified so
 nothing is silently applied or silently dropped:
 
 - **applied live** — keys handled by the transforms above
-- **relaunch to apply** — valid V2 keys with no runtime transform (`plugins`,
-  `compaction`, `lsp`, `instructions`, …); the exact `opencode <dir>` command is
-  printed
-- **legacy fields** — V1 keys V2 ignores, each with the fix (`agent` → `agents`,
-  `disable` → `disabled`, `permission` map → `permissions` array, `plugin` →
-  `plugins`, agent-level `prompt`/`temperature`/`variant`, …)
+- **relaunch to apply** — valid V2 keys with no runtime transform; the exact
+  `opencode <dir>` command is printed
+- **V1 but normalized by V2** — `autoupdate`, `small_model`,
+  `enabled_providers`, `disabled_providers`: OpenCode still honours them, each
+  with its native form shown
+- **legacy fields** — V1 keys V2 ignores, each with the fix
 - **unrecognized** — keys that match no known V2 field
 
-The TUI picker shows a `⚠ N legacy fields ignored` marker on affected profiles.
-This plugin reads V2 shapes only; it does not translate V1 configs.
+The legacy list covers the containers too, so nested damage is reported:
+`agent`/`mode` → `agents`, `plugin` → `plugins`, `permission` map and `tools` →
+`permissions`, `provider` → `providers` (with `npm` → `package`, `api`/`options` →
+`settings`), `command` → `commands`, `reference` → `references`, `autoshare` →
+`share`, `snapshot` → `snapshots`, `attachment` → `media`, `skills` as an object →
+array, `mcp` servers not nested under `servers`, top-level `subagent_depth` →
+`experimental.subagent_depth`, `logLevel` → `OPENCODE_LOG_LEVEL`, plus
+`experimental.*`, `compaction.*` and per-agent members
+(`disable`, `prompt`, `variant`, `maxSteps`, `temperature`, `options`, `name`, …).
 
+The native key set is the `Config.InfoEncoded` contract the server itself serves
+(`opencode api get /openapi.json`), which is 28 keys; `https://opencode.ai/config.json`
+still describes the V1 shape, so it is not a usable reference for this.
+
+The TUI picker shows a `⚠ N legacy fields ignored` marker on affected profiles and
+lists normalized V1 keys in the detail line.
+
+## Known limitations
+
+- Profiles are read in **native V2 shapes only**; a V1 `agent` map contributes no
+  agent models or disabled list, and is reported instead of translated. Add the
+  `.md` files or rename the key.
+- The permission hook runs **after** the configured ruleset, and an explicit
+  configured `deny` is final — so a profile can tighten or re-route a decision but
+  can never widen what `opencode.json(c)` already blocks.
+- `permissions` rules match `action` and `resource` globs with last-match-wins
+  precedence, mirroring OpenCode's own ruleset, but resource *semantics* (which
+  path a tool reports) are OpenCode core's, not this plugin's.
+- Session migration on switch sets the agent and model only; anything else the
+  profile changes mid-turn stays until the next request.
 
 ## What still needs a relaunch
 
-`plugin`, `plugins`, `experimental`, `compaction`, `subagent_depth`, `lsp`,
-`formatter`, `instructions`, `autoupdate`, `small_model`, and `snapshot` have no
-plugin transform. The picker and `/profile` list which of these a profile sets,
-and print the exact command:
+Everything else in the V2 key list has no plugin transform: `plugins`,
+`experimental`, `compaction`, `providers`, `lsp`, `formatter`, `instructions`,
+`skills`, `commands`, `references`, `watcher`, `media`, `tool_output`, `snapshots`,
+`worktree`, `warming`, `websearch`, `update`, `share`, `enterprise`, `username`,
+`shell`. The picker and `/profile` list which of these a profile sets, and print
+the exact command:
 
 ```sh
 opencode ~/.config/opencode/profiles/perf
@@ -181,9 +221,17 @@ opencode ~/.config/opencode/profiles/perf
 - Applying a profile that hides `build` while a session is running `build`
   removes that agent from future requests.
 - A profile whose `agents/*.md` files are missing still upserts the names found
-  in its `agent` config, but those have no prompt. The picker marks how many
+  in its `agents` config, but those have no prompt. The picker marks how many
   agents are new, and `/profile <name>` lists which were loaded.
 - Unreadable profiles are skipped rather than failing the load.
+
+## Development
+
+```sh
+bun install
+bun run typecheck   # tsc --noEmit against @opencode/plugin 2.x types
+bun test            # bun test, pure logic: refs, permissions, field lint
+```
 
 ## Implementation notes
 
@@ -202,3 +250,24 @@ compiles the badge/picker markup.
 rather than ignoring it — verified against a running server. That is what makes
 live agent loading possible, and it is also why an unknown name is never passed
 to it: doing so would produce a prompt-less stub.
+
+Things the 2.0.3 contract checks caught, worth knowing when you touch this:
+
+- The context hook's request overrides live on `event.options`. There is no
+  `event.generation` and no `event.providerOptions`; writing to those throws
+  inside every model request for the affected agent. Provider options are just
+  untyped keys on `options`, and `hook(name, callback, { providerID })` scopes
+  them properly.
+- `Agent.Info.name`, `Model.Ref.id` and `Model.Ref.providerID` are effect brands.
+  Build refs with `Model.Ref.parse("provider/model#variant")` (it throws on
+  garbage) and names with `Agent.Name.make(...)`; a plain `{ providerID, id }`
+  literal does not typecheck.
+- `Agent.Info` has no `native` field (`id`, `name`, `model?`, `request`,
+  `description?`, `mode`, `hidden`, `color?`, `steps?`, `permissions`). Guarding
+  on a field that never existed silently disabled the check.
+- Registration disposal is `Promise<void> | void`, so `registration.dispose().catch()`
+  is a type error; await it inside a try/catch.
+- A `Session.Info` carries `agent`, `model` and `location.directory`, which is how
+  `migrateSession` decides whether *this* location owns the session — the handoff
+  file is global, so without that check one switch would migrate the session once
+  per loaded location.

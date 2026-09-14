@@ -17,8 +17,10 @@ import path from "node:path"
 import fs from "node:fs"
 
 import { Plugin } from "@opencode/plugin"
+import { Agent } from "@opencode/schema"
 
 import {
+  agentMode,
   globalConfigDir,
   loadProfiles,
   mcpServers,
@@ -151,12 +153,11 @@ export default Plugin.define({
         const next = new Set<string>()
         // Retire agents a previous profile created by HIDING them, never removing:
         // removal orphans any session still bound to the agent
-        // (Session.AgentNotFoundError on its next turn). Native/system agents are
-        // never touched here.
+        // (Session.AgentNotFoundError on its next turn). `created` is the only
+        // authority on what this plugin made, so nothing else is ever touched.
         for (const name of created) {
           if (next.has(name)) continue
-          const existing = draft.get(name)
-          if (!existing || existing.native) continue
+          if (!draft.get(name)) continue
           draft.update(name, (agent) => {
             agent.hidden = true
           })
@@ -172,12 +173,13 @@ export default Plugin.define({
         for (const definition of active.agents) {
           next.add(definition.name)
           draft.update(definition.name, (agent) => {
-            agent.name = definition.name
+            agent.name = Agent.Name.make(definition.name)
             agent.hidden = false
             if (definition.description) agent.description = definition.description
-            if (definition.mode) agent.mode = definition.mode as typeof agent.mode
+            const mode = agentMode(definition.mode)
+            if (mode) agent.mode = mode
             if (definition.system) agent.system = definition.system
-            const ref = definition.model ? parseModelRef(definition.model) : undefined
+            const ref = parseModelRef(definition.model ?? "")
             if (ref) agent.model = ref
           })
         }
@@ -227,7 +229,11 @@ export default Plugin.define({
 
     // --- permissions -------------------------------------------------------
     // There is no ruleset transform, so the profile's permissions are enforced
-    // per decision, after the configured rules are evaluated.
+    // per decision through the evaluate hook, which runs after the configured
+    // rules. Two consequences: an explicit configured `deny` is final and never
+    // reaches the hook, so a profile cannot widen what config already blocks;
+    // and the profile's ordered { action, resource, effect } rules are replayed
+    // here with the same last-match-wins precedence OpenCode uses.
 
     registrations.push(
       await ctx.permission.hook("evaluate", (event) => {
@@ -241,22 +247,32 @@ export default Plugin.define({
 
     // --- per-agent generation tuning ---------------------------------------
     // V2 has no agent-level temperature/reasoningEffort/textVerbosity fields
-    // (opencode.ai/v2/docs/agents). The runtime equivalent is the context hook,
-    // which exposes event.agent, event.generation and event.providerOptions.
+    // (opencode.ai/v2/docs/agents). The runtime equivalent is the context hook's
+    // `options`: typed keys are generation settings, any other key is passed to
+    // the selected protocol as a provider option.
 
     registrations.push(
       await ctx.session.hook("context", (event) => {
         if (!active) return
         const agent = active.agents.find((definition) => definition.name === event.agent)
-        if (!agent) return
-        if (agent.temperature !== undefined) event.generation.temperature = agent.temperature
-        // reasoningEffort/textVerbosity are OpenAI request options; only send
-        // them to that provider so other providers are not given unknown fields.
-        if (event.model.providerID === "openai") {
-          if (agent.reasoningEffort) event.providerOptions.reasoningEffort = agent.reasoningEffort
-          if (agent.textVerbosity) event.providerOptions.textVerbosity = agent.textVerbosity
-        }
+        if (agent?.temperature !== undefined) event.options.temperature = agent.temperature
       }),
+    )
+
+    // reasoningEffort / textVerbosity are OpenAI request options, so scope that
+    // hook to the provider instead of handing other providers unknown fields.
+    registrations.push(
+      await ctx.session.hook(
+        "context",
+        (event) => {
+          if (!active) return
+          const agent = active.agents.find((definition) => definition.name === event.agent)
+          if (!agent) return
+          if (agent.reasoningEffort) event.options.reasoningEffort = agent.reasoningEffort
+          if (agent.textVerbosity) event.options.textVerbosity = agent.textVerbosity
+        },
+        { providerID: "openai" },
+      ),
     )
 
     // --- /profile ----------------------------------------------------------
@@ -270,6 +286,7 @@ export default Plugin.define({
       if (w.applied.length) lines.push(`- applied live: ${w.applied.join(", ")}`)
       if (w.relaunch.length)
         lines.push(`- relaunch to apply: ${w.relaunch.join(", ")} — \`opencode ${profile.directory}\``)
+      if (w.adapted.length) lines.push(`- V1 but normalized by V2:\n${w.adapted.map((l) => `    - ${l}`).join("\n")}`)
       if (w.legacy.length) lines.push(`- legacy fields (ignored by V2):\n${w.legacy.map((l) => `    - ${l}`).join("\n")}`)
       if (w.unknown.length) lines.push(`- unrecognized fields (ignored): ${w.unknown.join(", ")}`)
       return lines.join("\n")
@@ -349,7 +366,13 @@ export default Plugin.define({
     return async () => {
       clearTimeout(timer)
       watcher.close()
-      for (const registration of registrations) await registration.dispose().catch(() => {})
+      for (const registration of registrations) {
+        try {
+          await registration.dispose()
+        } catch {
+          // Already torn down by the host; nothing left to undo.
+        }
+      }
     }
   },
 })

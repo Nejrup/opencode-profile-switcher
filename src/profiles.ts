@@ -11,6 +11,8 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
+import { Model } from "@opencode/schema"
+
 // --- paths -----------------------------------------------------------------
 
 /** Global OpenCode config dir, honouring XDG_CONFIG_HOME (appends /opencode). */
@@ -117,21 +119,19 @@ export function readJsonc(file: string): any | undefined {
 // --- model refs ------------------------------------------------------------
 
 /**
- * "provider/model" or "provider/model#variant" -> the shape Model.Ref expects.
- * See https://opencode.ai/v2/docs/agents/ ("Selects a model using provider/model
- * with an optional #variant").
+ * "provider/model" or "provider/model#variant" -> a branded Model.Ref.
+ * The contract's own parser is the only supported way to build one: ids and
+ * providerIDs are effect brands, so a plain object of strings does not typecheck.
+ * Returns undefined instead of throwing so a bad profile entry is skipped.
  */
-export function parseModelRef(
-  ref: string,
-): { providerID: string; id: string; variant?: string } | undefined {
+export function parseModelRef(ref: string): Model.Ref | undefined {
   const i = ref.indexOf("/")
   if (i <= 0 || i === ref.length - 1) return undefined
-  const providerID = ref.slice(0, i)
-  const rest = ref.slice(i + 1)
-  const hash = rest.indexOf("#")
-  const id = hash === -1 ? rest : rest.slice(0, hash)
-  const variant = hash === -1 ? undefined : rest.slice(hash + 1) || undefined
-  return { providerID, id, variant }
+  try {
+    return Model.Ref.parse(ref)
+  } catch {
+    return undefined
+  }
 }
 
 // --- agent markdown --------------------------------------------------------
@@ -148,11 +148,19 @@ export type AgentDefinition = {
   textVerbosity?: string
 }
 
+const AGENT_MODES = new Set(["subagent", "primary", "all"])
+export type AgentMode = "subagent" | "primary" | "all"
+
+/** The agent mode, or undefined when the frontmatter value is not a V2 mode. */
+export function agentMode(value: string | undefined): AgentMode | undefined {
+  return value && (AGENT_MODES as Set<string>).has(value) ? (value as AgentMode) : undefined
+}
+
 /**
  * Read top-level scalar keys from YAML frontmatter plus the body as the prompt.
  * Nested blocks (permission trees) are skipped: Agent.Info has no shape here
- * that we can build from docs alone, and the profile's `permission` map is
- * enforced separately by the server half.
+ * that we can build from docs alone, and the profile's top-level `permissions`
+ * array is enforced instead.
  */
 export function parseAgentMarkdown(name: string, text: string): AgentDefinition {
   const lines = text.replace(/\r\n/g, "\n").split("\n")
@@ -183,13 +191,14 @@ export function parseAgentMarkdown(name: string, text: string): AgentDefinition 
   }
   const body = end === -1 ? text : lines.slice(end + 1).join("\n")
   const temperature = scalars.get("temperature")
+  const parsed = temperature !== undefined && temperature !== "" ? Number(temperature) : undefined
   return {
     name,
     description: scalars.get("description"),
     mode: scalars.get("mode") ?? scalars.get("permission_mode"),
     model: scalars.get("model"),
     system: body.trim() || undefined,
-    temperature: temperature !== undefined && temperature !== "" ? Number(temperature) : undefined,
+    temperature: parsed !== undefined && Number.isFinite(parsed) ? parsed : undefined,
     reasoningEffort: scalars.get("reasoningeffort"),
     textVerbosity: scalars.get("textverbosity"),
   }
@@ -211,62 +220,107 @@ export function readAgents(directory: string): AgentDefinition[] {
 
 // --- permissions -----------------------------------------------------------
 
-export type PermissionRule = { pattern: string; effect: "allow" | "ask" | "deny" }
+export type Effect = "allow" | "ask" | "deny"
+export type PermissionRule = { action: string; resource: string; effect: Effect }
 
-const EFFECTS = new Set(["allow", "ask", "deny"])
+const EFFECTS = new Set<Effect>(["allow", "ask", "deny"])
 
 /**
  * Read V2 permissions: an ordered array of {action, resource, effect}.
- * https://opencode.ai/v2/docs/config/ "Permissions"
- * Resource granularity is not expressible in this flat matcher, so a rule
- * matches every resource of its action.
+ * https://opencode.ai/v2/docs/config "Permissions"
+ * A rule without a `resource` applies to every resource of its action.
  */
 export function toPermissionRules(value: unknown): PermissionRule[] {
   const out: PermissionRule[] = []
   if (!Array.isArray(value)) return out
   for (const rule of value) {
     if (!rule || typeof rule !== "object") continue
-    const { action, effect } = rule as Record<string, unknown>
-    if (typeof action !== "string" || typeof effect !== "string" || !EFFECTS.has(effect)) continue
-    out.push({ pattern: action, effect: effect as PermissionRule["effect"] })
+    const { action, resource, effect } = rule as Record<string, unknown>
+    if (typeof action !== "string") continue
+    if (typeof effect !== "string" || !EFFECTS.has(effect as Effect)) continue
+    out.push({
+      action,
+      resource: typeof resource === "string" && resource !== "" ? resource : "*",
+      effect: effect as Effect,
+    })
   }
   return out
 }
 
 function globToRegExp(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, ".*")
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")
   return new RegExp(`^${escaped}$`)
 }
 
-/** Strictest matching rule wins: deny over ask over allow. */
+function matches(pattern: string, value: string): boolean {
+  return globToRegExp(pattern).test(value)
+}
+
+/**
+ * Last matching rule wins, matching OpenCode's own ordered ruleset
+ * (https://opencode.ai/v2/docs/permissions). A rule matches when its `action`
+ * glob hits the evaluated action and its `resource` glob hits one of the
+ * resources; an action with no resources is matched by `resource: "*"`.
+ */
 export function resolveEffect(
   rules: PermissionRule[],
   action: string,
   resources: readonly string[],
-): PermissionRule["effect"] | undefined {
-  const rank = { allow: 1, ask: 2, deny: 3 } as const
-  let best: PermissionRule["effect"] | undefined
+): Effect | undefined {
+  let effect: Effect | undefined
   for (const rule of rules) {
-    const re = globToRegExp(rule.pattern)
-    if (!(re.test(action) || resources.some((resource) => re.test(resource)))) continue
-    if (!best || rank[rule.effect] > rank[best]) best = rule.effect
+    if (!matches(rule.action, action)) continue
+    if (rule.resource !== "*") {
+      if (resources.length === 0) continue
+      if (!resources.some((resource) => matches(rule.resource, resource))) continue
+    }
+    effect = rule.effect
   }
-  return best
+  return effect
+}
+
+// --- mcp -------------------------------------------------------------------
+
+/**
+ * V2 nests servers under mcp.servers. Entries are passed through with the V1
+ * `enabled` flag folded into the native `disabled` so a profile written in the
+ * old shape still applies, and structurally invalid servers are skipped.
+ */
+export function mcpServers(config: any): Record<string, any> {
+  const servers = config?.mcp?.servers
+  if (!servers || typeof servers !== "object") return {}
+  const out: Record<string, any> = {}
+  for (const [name, value] of Object.entries(servers as Record<string, any>)) {
+    if (!value || typeof value !== "object") continue
+    const { enabled, ...rest } = value
+    const server = enabled === false ? { ...rest, disabled: true } : rest
+    const type =
+      server.type ?? (Array.isArray(server.command) ? "local" : typeof server.url === "string" ? "remote" : undefined)
+    if (type !== "local" && type !== "remote") continue
+    if (type === "local" && !Array.isArray(server.command)) continue
+    if (type === "remote" && typeof server.url !== "string") continue
+    out[name] = { ...server, type }
+  }
+  return out
 }
 
 // --- field classification --------------------------------------------------
 //
 // The switcher only reads V2 shapes. At switch time it lints the profile config
 // so nothing is silently applied or silently dropped.
-// Source of truth: https://opencode.ai/v2/docs/config/ and /v2/docs/agents/
+//
+// Source of truth: the Config contract the server itself serves
+// (`opencode api get /openapi.json` -> Config.InfoEncoded, 28 properties) plus
+// https://opencode.ai/v2/docs/config and /v2/docs/migrate-v1.
 
-/** Top-level keys OpenCode V2 accepts (opencode.ai/v2/docs/config). */
+/** Native V2 top-level keys. */
 const V2_TOP = new Set([
   "shell",
   "model",
   "default_agent",
-  "autoupdate",
+  "update",
   "share",
+  "enterprise",
   "username",
   "permissions",
   "agents",
@@ -278,41 +332,91 @@ const V2_TOP = new Set([
   "tool_output",
   "mcp",
   "compaction",
-  "warming",
   "skills",
   "commands",
   "instructions",
   "references",
+  "websearch",
   "plugins",
+  "worktree",
+  "warming",
   "providers",
+  "experimental",
 ])
 
 /** Keys the switcher applies live through plugin transforms. */
 const APPLIED_LIVE = new Set(["agents", "default_agent", "model", "mcp", "permissions"])
 
-/** V1 top-level keys V2 ignores, with the V2 replacement. */
-const LEGACY_TOP: Record<string, string> = {
-  agent: 'rename to "agents"',
-  plugin: 'rename to "plugins"',
-  permission: 'rename to "permissions" (array of { action, resource, effect })',
-  small_model: "no V2 equivalent — dropped",
-  subagent_depth: "no V2 equivalent — dropped",
-  experimental: "not a V2 config field — dropped",
-  mode: 'rename to "agents"',
+/** V1 keys that have a native V2 name, and still work while unconverted. */
+const ADAPTED_TOP: Record<string, string> = {
+  autoupdate: 'native form: "update": "disable" | "notify" | "auto"',
+  small_model: 'native form: "agents": { "title": { "model": … } }',
+  enabled_providers: "native form: permissions rules",
+  disabled_providers: "native form: permissions rules",
 }
 
-/** Legacy per-agent keys (opencode.ai/v2/docs/agents: "Do not use legacy ..."). */
+/** V1/unsupported keys V2 ignores, with the fix. */
+const LEGACY_TOP: Record<string, string> = {
+  agent: 'rename to "agents"',
+  mode: 'rename to "agents" (entries become primary agents)',
+  plugin: 'rename to "plugins"',
+  permission: 'rename to "permissions" (array of { action, resource, effect })',
+  tools: 'express through "permissions" (e.g. { action: "websearch", resource: "*", effect: "deny" })',
+  provider: 'rename to "providers"; npm -> package "aisdk:<pkg>", api/options -> settings',
+  command: 'rename to "commands"',
+  reference: 'rename to "references"',
+  autoshare: 'use "share": "auto"',
+  snapshot: 'rename to "snapshots"',
+  attachment: 'rename to "media"',
+  subagent_depth: 'use "experimental": { "subagent_depth": n }',
+  logLevel: "no config field — set OPENCODE_LOG_LEVEL when starting OpenCode",
+  server: "no V2 equivalent — use the service and explicit server options",
+  theme: "terminal-only — move to cli.json",
+  keybinds: "terminal-only — move to cli.json",
+}
+
+/** V2 keeps this key but only accepts these members (/v2/docs/config). */
+const V2_EXPERIMENTAL = new Set(["portable_shell_scanner", "subagent_depth", "policies"])
+const LEGACY_EXPERIMENTAL: Record<string, string> = {
+  batch_tool: "no V2 equivalent — ignored",
+  disable_paste_summary: "no V2 equivalent — ignored",
+  continue_loop_on_deny: "no V2 equivalent — ignored",
+  openTelemetry: "no V2 equivalent — ignored",
+  primary_tools: "no V2 equivalent — ignored",
+  mcp_timeout: 'use "mcp": { "timeout": { catalog, execution } }',
+}
+
+const LEGACY_COMPACTION: Record<string, string> = {
+  prune: "no V2 equivalent — ignored",
+  tail_turns: "no V2 equivalent — V2 keeps a token budget",
+  preserve_recent_tokens: 'use "keep": { "tokens": n }',
+  reserved: 'use "buffer": n',
+}
+
+const LEGACY_PROVIDER: Record<string, string> = {
+  npm: 'use "package": "aisdk:<pkg>"',
+  api: 'use "settings": { "baseURL": … }',
+  options: 'split into "settings" / "headers" / "body"',
+  id: "no V2 equivalent — ignored",
+  whitelist: "no V2 equivalent — ignored",
+  blacklist: "no V2 equivalent — ignored",
+}
+
+/** Legacy per-agent keys (opencode.ai/v2/docs/agents, /v2/docs/migrate-v1). */
 const LEGACY_AGENT: Record<string, string> = {
   disable: 'use "disabled: true"',
   prompt: 'use "system"',
+  permission: 'use "permissions" (array)',
+  maxSteps: 'use "steps"',
+  variant: 'fold into model: "provider/model#variant"',
   temperature: "put it in the agent's .md frontmatter (applied at runtime)",
-  top_p: "set on the model/provider instead",
+  top_p: "use request.body, or the model/provider default",
+  topP: "use request.body, or the model/provider default",
   reasoningEffort: "put it in the agent's .md frontmatter (applied at runtime)",
   textVerbosity: "put it in the agent's .md frontmatter (applied at runtime)",
-  variant: 'fold into model: "provider/model#variant"',
+  options: "use request.body / settings",
   tools: "not a V2 agent field",
-  maxSteps: 'use "steps"',
-  permission: 'use "permissions" (array)',
+  name: "not a V2 agent field — the map key is the id",
 }
 
 export type ProfileWarnings = {
@@ -320,14 +424,31 @@ export type ProfileWarnings = {
   applied: string[]
   /** Valid V2, but only take effect on a relaunch in that directory. */
   relaunch: string[]
+  /** V1 keys OpenCode still normalizes, so they work but are not native. */
+  adapted: string[]
   /** V1/legacy fields V2 ignores, each with the fix. */
   legacy: string[]
   /** Keys that match no known V2 field. */
   unknown: string[]
 }
 
+function lintNested(
+  config: any,
+  warnings: ProfileWarnings,
+  path: string,
+  allowed: Set<string>,
+  legacy: Record<string, string>,
+) {
+  const value = config?.[path]
+  if (!value || typeof value !== "object" || Array.isArray(value)) return
+  for (const field of Object.keys(value)) {
+    if (legacy[field]) warnings.legacy.push(`${path}.${field} — ${legacy[field]}`)
+    else if (!allowed.has(field)) warnings.unknown.push(`${path}.${field}`)
+  }
+}
+
 export function classifyConfig(config: any): ProfileWarnings {
-  const warnings: ProfileWarnings = { applied: [], relaunch: [], legacy: [], unknown: [] }
+  const warnings: ProfileWarnings = { applied: [], relaunch: [], adapted: [], legacy: [], unknown: [] }
   if (!config || typeof config !== "object") return warnings
 
   for (const key of Object.keys(config)) {
@@ -340,6 +461,10 @@ export function classifyConfig(config: any): ProfileWarnings {
       warnings.relaunch.push(key)
       continue
     }
+    if (ADAPTED_TOP[key]) {
+      warnings.adapted.push(`${key} — ${ADAPTED_TOP[key]}`)
+      continue
+    }
     if (LEGACY_TOP[key]) {
       warnings.legacy.push(`${key} — ${LEGACY_TOP[key]}`)
       continue
@@ -349,14 +474,29 @@ export function classifyConfig(config: any): ProfileWarnings {
 
   // Shape checks on keys that are valid but easy to write in the V1 shape.
   if (config.permissions !== undefined && !Array.isArray(config.permissions))
-    warnings.legacy.push('permissions — must be an array of { action, resource, effect }')
+    warnings.legacy.push("permissions — must be an array of { action, resource, effect }")
+  if (config.skills !== undefined && !Array.isArray(config.skills))
+    warnings.legacy.push('skills — combine "paths" and "urls" into one array')
   if (config.mcp && typeof config.mcp === "object" && !("servers" in config.mcp) && Object.keys(config.mcp).length)
     warnings.legacy.push('mcp — nest servers under "mcp.servers"')
 
+  lintNested(config, warnings, "experimental", V2_EXPERIMENTAL, LEGACY_EXPERIMENTAL)
+  lintNested(config, warnings, "compaction", new Set(["auto", "keep", "buffer"]), LEGACY_COMPACTION)
+
+  // Provider entries keep the V1 shape easily; lint both container names.
+  for (const key of ["providers", "provider"] as const) {
+    for (const [id, provider] of Object.entries((config[key] ?? {}) as Record<string, any>)) {
+      if (!provider || typeof provider !== "object") continue
+      for (const field of Object.keys(provider)) {
+        if (LEGACY_PROVIDER[field])
+          warnings.legacy.push(`${key}.${id}.${field} — ${LEGACY_PROVIDER[field]}`)
+      }
+    }
+  }
+
   // Legacy per-agent fields anywhere in the agents map.
-  const agents = config.agents ?? {}
   const seen = new Set<string>()
-  for (const agent of Object.values(agents)) {
+  for (const agent of Object.values((config.agents ?? {}) as Record<string, unknown>)) {
     if (!agent || typeof agent !== "object") continue
     for (const field of Object.keys(agent as Record<string, unknown>)) {
       if (LEGACY_AGENT[field] && !seen.has(field)) {
@@ -398,6 +538,7 @@ const CONFIG_NAMES = ["opencode.jsonc", "opencode.json"]
  * The global base config (opencode.jsonc / opencode.json). Read when switching
  * back to base so the session can be moved onto whatever agent/model the base
  * config itself defines (default_agent, agents.<name>.model, or top-level model).
+ * OpenCode merges both files when present and .jsonc wins, so read in that order.
  */
 export function readBaseConfig(): any | undefined {
   for (const name of CONFIG_NAMES) {
@@ -405,12 +546,6 @@ export function readBaseConfig(): any | undefined {
     if (parsed && typeof parsed === "object") return parsed
   }
   return undefined
-}
-
-/** V2 nests MCP servers under mcp.servers. */
-export function mcpServers(config: any): Record<string, any> {
-  const servers = config?.mcp?.servers
-  return servers && typeof servers === "object" ? servers : {}
 }
 
 function summarize(config: any): string {
@@ -438,7 +573,7 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
     const meta = readJsonc(path.join(directory, "profile.jsonc")) ?? {}
 
     // V2 shapes only (opencode.ai/v2/docs/agents, /v2/docs/config). Anything in
-    // a V1 shape is not read here; classifyConfig reports it as legacy instead.
+    // a V1 shape is not read here; classifyConfig reports it instead.
     const agents: Record<string, any> = config.agents ?? {}
     const warnings = classifyConfig(config)
 
