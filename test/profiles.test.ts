@@ -5,10 +5,14 @@ import {
   classifyConfig,
   cliBinary,
   mcpServers,
+  nextRestartPolicy,
+  normalizeRestartPolicy,
   parseAgentMarkdown,
   parseModelRef,
   referenceSources,
+  restartEnv,
   resolveEffect,
+  staleAgentNames,
   startupInfo,
   startupLabel,
   toPermissionRules,
@@ -349,6 +353,56 @@ describe("cliBinary", () => {
     expect(cliBinary({}, "/opt/opencode/opencode.exe")).toBe("/opt/opencode/opencode.exe")
     expect(cliBinary({}, "/usr/local/bin/bun")).toBe("opencode")
     expect(cliBinary({}, "/usr/local/bin/node")).toBe("opencode")
+  })
+})
+
+describe("staleAgentNames", () => {
+  const fast = { declaredAgents: ["scout", "coder"] }
+  const deep = { declaredAgents: ["architect", "explorer"] }
+
+  test("lists names the active profile does not define", () => {
+    expect(staleAgentNames([fast, deep], deep)).toEqual(["scout", "coder"])
+  })
+
+  test("with no active profile every declared name is a candidate", () => {
+    expect(staleAgentNames([fast, deep])).toEqual(["scout", "coder", "architect", "explorer"])
+  })
+
+  test("deduplicates across profiles", () => {
+    expect(staleAgentNames([fast, { declaredAgents: ["coder", "scribe"] }], fast)).toEqual(["scribe"])
+  })
+
+  test("an empty active profile leaves everything", () => {
+    expect(staleAgentNames([fast], { declaredAgents: [] })).toEqual(["scout", "coder"])
+  })
+})
+
+describe("restart policy", () => {
+  test("normalizes the pre-1.4 boolean preference", () => {
+    expect(normalizeRestartPolicy({})).toBe("ask")
+    expect(normalizeRestartPolicy(undefined)).toBe("ask")
+    expect(normalizeRestartPolicy({ askRestart: false })).toBe("never")
+    expect(normalizeRestartPolicy({ askRestart: true })).toBe("ask")
+    expect(normalizeRestartPolicy({ askRestart: false, restartPolicy: "always" })).toBe("always")
+    expect(normalizeRestartPolicy({ restartPolicy: "bogus", askRestart: false })).toBe("never")
+  })
+
+  test("cycles ask -> always -> never", () => {
+    expect(nextRestartPolicy("ask")).toBe("always")
+    expect(nextRestartPolicy("always")).toBe("never")
+    expect(nextRestartPolicy("never")).toBe("ask")
+  })
+
+  test("reverting to base must not inherit the layered file", () => {
+    const base = { PATH: "/usr/bin", OPENCODE_CONFIG: "/old/profile/opencode.jsonc" }
+    const layered = restartEnv("/new/profile/opencode.jsonc", base)
+    expect(layered.OPENCODE_CONFIG).toBe("/new/profile/opencode.jsonc")
+    expect(layered.PATH).toBe("/usr/bin")
+
+    const cleared = restartEnv(null, base)
+    expect("OPENCODE_CONFIG" in cleared).toBe(false)
+    // the caller's env object is never mutated
+    expect(base.OPENCODE_CONFIG).toBe("/old/profile/opencode.jsonc")
   })
 })
 

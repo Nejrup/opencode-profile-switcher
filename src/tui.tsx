@@ -30,15 +30,25 @@ import { Plugin } from "@opencode/plugin/tui"
 import {
   cliBinary,
   loadProfiles,
+  nextRestartPolicy,
+  normalizeRestartPolicy,
   profilesRoot,
   readSelection,
   readSelectionState,
+  restartEnv,
   startupInfo,
   stateFile,
   writeSelection,
   type Profile,
+  type RestartPolicy,
   type StartupInfo,
 } from "./profiles.ts"
+
+const POLICY_LABEL: Record<RestartPolicy, string> = {
+  ask: "ask before restarting",
+  always: "always restart to apply",
+  never: "label only, never restart",
+}
 
 export default Plugin.define({
   id: "profile-switcher-tui",
@@ -52,9 +62,16 @@ export default Plugin.define({
       initial: { name: readSelection() },
     })
 
-    const [prefs, setPrefs] = context.storage.store<{ askRestart: boolean }>("preferences", {
-      initial: { askRestart: true },
+    // `askRestart` is the pre-1.4 shape of this preference; keep it readable so
+    // existing installs keep their choice, mapped onto the new policy.
+    const [prefs, setPrefs] = context.storage.store<{
+      askRestart?: boolean
+      restartPolicy?: RestartPolicy
+    }>("preferences", {
+      initial: { restartPolicy: "ask" },
     })
+    const policy = (): RestartPolicy =>
+      normalizeRestartPolicy({ askRestart: prefs.askRestart, restartPolicy: prefs.restartPolicy })
 
     // The server's verdict about startup-only keys, echoed through the handoff
     // file — only the server process knows its own OPENCODE_CONFIG.
@@ -157,21 +174,27 @@ export default Plugin.define({
         ? { kind: startup.kind, keys: startup.keys.length ? startup.keys : profile.warnings.relaunch, command: startup.command }
         : startupInfo(profile.configFile, profile.warnings.relaunch)
 
-    const restartWith = (profile: Profile) => {
-      const info = startupInfo(profile.configFile, profile.warnings.relaunch)
+    const restartWith = (profile: Profile | null) => {
+      const file = profile?.configFile ?? null
+      const command = profile
+        ? startupInfo(profile.configFile, profile.warnings.relaunch).command
+        : "opencode service restart"
       try {
         spawn(cliBinary(), ["service", "restart"], {
-          env: { ...process.env, OPENCODE_CONFIG: profile.configFile },
+          env: restartEnv(file),
           detached: true,
           stdio: "ignore",
         }).unref()
         setStartup((draft) => {
-          draft.kind = "layered"
-          draft.profile = profile.name
+          draft.profile = profile?.name ?? null
+          draft.kind = profile ? "layered" : "none"
+          draft.keys = []
         })
         context.ui.toast.show({
           title: "Profile",
-          message: `restarting the service with ${profile.name} layered in — relaunch opencode if the terminal does not reconnect`,
+          message: profile
+            ? `restarting with ${profile.name} layered in — relaunch opencode if the terminal does not reconnect`
+            : "restarting with no profile layered in — the previous profile's plugins and providers go away",
           variant: "info",
           duration: 6000,
         })
@@ -179,7 +202,7 @@ export default Plugin.define({
         console.warn("[profile-switcher] restart failed", error)
         context.ui.toast.show({
           title: "Profile",
-          message: `could not restart the service — run: ${info.command ?? "opencode service restart"}`,
+          message: `could not restart the service — run: ${command ?? "opencode service restart"}`,
           variant: "error",
           duration: 8000,
         })
@@ -191,11 +214,11 @@ export default Plugin.define({
      * writes `startup`, the TUI's own write does not, so its presence means the
      * server has caught up with this switch.
      */
-    const waitForVerdict = async (name: string, profile: Profile, timeoutMs = 1500): Promise<StartupInfo> => {
+    const waitForVerdict = async (profile: Profile, timeoutMs = 1500): Promise<StartupInfo> => {
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         const state = readSelectionState()
-        if (state.profile === name && state.startup) {
+        if (state.profile === profile.name && state.startup) {
           syncStartup()
           return state.startup
         }
@@ -204,8 +227,32 @@ export default Plugin.define({
       return startupInfo(profile.configFile, profile.warnings.relaunch)
     }
 
-    const offerRestart = async (profile: Profile) => {
-      const info = await waitForVerdict(profile.name, profile)
+    /**
+     * What happens after a switch, per the restart policy:
+     * `always` bounces the service (including back to base, which is the only way
+     * to drop plugins the previous profile layered in), `ask` confirms first,
+     * `never` only leaves the marker and the command.
+     */
+    const offerRestart = async (profile: Profile | null) => {
+      if (policy() === "always") {
+        restartWith(profile)
+        return
+      }
+      if (!profile) return
+
+      if (policy() === "never") {
+        const info = startupInfo(profile.configFile, profile.warnings.relaunch)
+        if (info.kind === "pending" && info.command)
+          context.ui.toast.show({
+            title: "Profile",
+            message: `⟳ ${info.keys.join(", ")} need a restart — ${info.command}`,
+            variant: "warning",
+            duration: 7000,
+          })
+        return
+      }
+
+      const info = await waitForVerdict(profile)
       if (info.kind === "layered") {
         context.ui.toast.show({
           title: "Profile",
@@ -216,16 +263,6 @@ export default Plugin.define({
         return
       }
       if (info.kind !== "pending" || !info.command) return
-
-      if (!prefs.askRestart) {
-        context.ui.toast.show({
-          title: "Profile",
-          message: `⟳ ${info.keys.join(", ")} need a restart — ${info.command}`,
-          variant: "warning",
-          duration: 7000,
-        })
-        return
-      }
 
       let confirmed = false
       try {
@@ -281,6 +318,8 @@ export default Plugin.define({
     const switchTo = (name: string | null) => {
       if (applied.name === name) return
       const sessionID = currentSessionID()
+      // Read before the switch clears it: a layered profile needs a bounce to un-layer.
+      const wasLayered = startup.profile === applied.name && startup.kind === "layered"
       writeSelection(name, sessionID)
       remember(name)
       invalidateProfiles()
@@ -309,7 +348,12 @@ export default Plugin.define({
       }
       notify(name)
       const target = name ? profiles().find((profile) => profile.name === name) : undefined
-      if (target) void offerRestart(target)
+      if (target) {
+        void offerRestart(target)
+      } else if (policy() === "always" && wasLayered) {
+        // Back on base: the layered file has to go, and only a restart drops it.
+        void offerRestart(null)
+      }
     }
 
     const detail = (profile: Profile) => {
@@ -402,29 +446,32 @@ export default Plugin.define({
             },
           },
           {
-            id: "profile-switcher.toggle-prompt",
-            title: prefs.askRestart ? "Profile restart prompt: ask" : "Profile restart prompt: label only",
-            description: "Switch between a confirmation dialog and just marking profiles that need a restart",
+            id: "profile-switcher.policy",
+            title: `Profile restart policy: ${POLICY_LABEL[policy()]}`,
+            description: "Cycle: ask before restarting, always restart to apply the whole profile, or label only",
             group: "Profile",
             bind: false,
             palette: true,
             run: () => {
-              const next = !prefs.askRestart
+              const next = nextRestartPolicy(policy())
               setPrefs((draft) => {
-                draft.askRestart = next
+                draft.restartPolicy = next
               })
               context.ui.toast.show({
                 title: "Profile",
-                message: next
-                  ? "will ask before restarting the service"
-                  : "will only mark profiles that need a restart — restart from the palette",
-                variant: "info",
-                duration: 3000,
+                message:
+                  next === "ask"
+                    ? "will ask before restarting the service"
+                    : next === "always"
+                      ? "every switch restarts the service, so plugins and providers swap both ways — running turns are interrupted"
+                      : "will only mark profiles that need a restart — restart from the palette",
+                variant: next === "always" ? "warning" : "info",
+                duration: 5000,
               })
             },
           },
         ],
-        bindings: ["profile-switcher.pick", "profile-switcher.restart", "profile-switcher.toggle-prompt"],
+        bindings: ["profile-switcher.pick", "profile-switcher.restart", "profile-switcher.policy"],
       }))
       // Reactive store reads — re-renders when remember()/setStartup() change.
       const mark = startup.profile === applied.name ? (startup.kind === "pending" ? " ⟳" : startup.kind === "layered" ? " ✓" : "") : ""

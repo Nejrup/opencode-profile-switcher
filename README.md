@@ -196,7 +196,12 @@ Two deliberate choices behind the table:
   retires just leaves the picker.
 - **The session you are in gets moved.** Applying a profile switches the current
   session onto the profile's default agent and model, and the terminal's own
-  caches are re-synced so it's visible without a relaunch.
+  caches are re-synced so it's visible without a relaunch. Reverting to base moves
+  it to your base config's `default_agent`, falling back to the built-in `build`.
+- **Agent visibility is derived per switch, never sticky.** Each replay starts
+  from the base registry, so agents a profile hid or restyled come back exactly
+  as configured when you drop the profile. Names only *other* profiles declare
+  stay registered as hidden stubs, so a session bound to one is never orphaned.
 
 ### When a profile needs a restart
 
@@ -216,10 +221,21 @@ the service *with the profile layered in*, which applies those keys for real:
 - right after you apply one, a dialog asks: **Restart the service?** — confirming
   runs `opencode service restart` with `OPENCODE_CONFIG=<profile>/opencode.jsonc`
 - the marker then reads **`✓ startup loaded`**, and `/profile` says so too
-- not a popup person? Palette → **"Profile restart prompt: label only"** keeps
-  the marker and drops the dialog; the toast then prints the command instead
+- three restart policies, cycled from the palette (**"Profile restart policy: …"**):
+
+  | Policy | Behaviour |
+  | --- | --- |
+  | **ask** *(default)* | `⟳` marker + a confirmation dialog after you apply a profile that needs it |
+  | **always** | every switch restarts the service with the new profile layered in — and switching back to base restarts **without** it, so `plugins`, `providers` and friends a profile added actually go away. Cost: a service bounce per switch, so a running turn is always interrupted |
+  | **never** | marker and a toast with the command only; you restart yourself |
+
 - at any time: palette → **"Restart service with profile"** (enabled only while
   something is pending), or `/profile restart` to copy the command yourself
+
+With **always**, a profile becomes a full config layer rather than a partial
+overlay: nothing is left behind between switches. It is still not removing
+plugins that your *global* config loads — those are always there — only the ones
+the layered profile file added.
 
 What a restart costs you:
 
@@ -310,6 +326,8 @@ rather than guessing at a translation.
 | Terminal stops responding after a restart | the client did not rediscover the service | relaunch `opencode` — sessions and history are on disk |
 | `could not restart the service` toast | the CLI is not the running binary (wrapper, `bun`, a shim) | set `OPENCODE_BIN` to the real `opencode` executable |
 | Two OpenCode windows disagree | the handoff file is global, one switch wakes every loaded location | intentional today; see [Limits](#known-limits) |
+| Reverting to base left an agent hidden / the session stuck on a profile agent | 1.3.0 and earlier hid base agents and never restored them | update the plugin (`opencode plugin update`) — visibility is derived per switch now |
+| `/profile none` did not move the session back to `build` | your base config sets no `default_agent`, and the session was left on the profile's agent by the old build | update, then `/profile none` again; base falls back to `build` |
 
 ## Known limits
 
@@ -336,7 +354,7 @@ rather than guessing at a translation.
 ```sh
 bun install
 bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.x types
-bun test            # 37 tests: refs, permission precedence, field lint, references, startup, frontmatter
+bun test            # 44 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter
 ```
 
 Iterate without pushing: `./install.sh` registers this checkout with

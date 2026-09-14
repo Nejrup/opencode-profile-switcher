@@ -30,6 +30,7 @@ import {
   readSelectionState,
   referenceSources,
   resolveEffect,
+  staleAgentNames,
   startupInfo,
   stateFile,
   websearchSelection,
@@ -46,8 +47,6 @@ export default Plugin.define({
     let active: Profile | undefined
     let profiles: Profile[] = []
     let previous: string | null = null
-    /** Agents this plugin created, so a later switch can hide them again. */
-    let created = new Set<string>()
     /** Every registration, disposed on unload so hot-reloads do not stack. */
     const registrations: Array<{ dispose(): Promise<void> | void }> = []
 
@@ -159,64 +158,64 @@ export default Plugin.define({
 
     registrations.push(
       await ctx.agent.transform((draft) => {
-        const next = new Set<string>()
-        // Retire agents a previous profile created by HIDING them, never removing:
-        // removal orphans any session still bound to the agent
-        // (Session.AgentNotFoundError on its next turn). `created` is the only
-        // authority on what this plugin made, so nothing else is ever touched.
-        for (const name of created) {
-          if (next.has(name)) continue
-          if (!draft.get(name)) continue
-          draft.update(name, (agent) => {
-            agent.hidden = true
-          })
-        }
+        // Transforms replay onto a fresh registry, so nothing a previous profile
+        // changed can survive into this one: base agents come back exactly as
+        // configured. That is what makes `/profile none` restore `build` — the
+        // `created` bookkeeping this replaces *hid* those agents instead, and
+        // nothing ever un-hid them, so reverting could not switch back to them.
+        const fromFiles = new Set<string>()
 
-        if (!active) {
-          created = next
-          return
-        }
+        if (active) {
+          for (const definition of active.agents) {
+            fromFiles.add(definition.name)
+            draft.update(definition.name, (agent) => {
+              agent.name = Agent.Name.make(definition.name)
+              agent.hidden = false
+              if (definition.description) agent.description = definition.description
+              const mode = agentMode(definition.mode)
+              if (mode) agent.mode = mode
+              if (definition.system) agent.system = definition.system
+              const ref = parseModelRef(definition.model ?? "")
+              if (ref) agent.model = ref
+            })
+          }
 
-        const fromFiles = new Set(active.agents.map((definition) => definition.name))
+          for (const { agent: name, model } of active.agentModels) {
+            // Config model overrides target agents that already exist, or that
+            // this profile ships a definition for. Never invent a nameless stub.
+            const ref = parseModelRef(model)
+            if (!ref) continue
+            if (!draft.get(name) && !fromFiles.has(name)) continue
+            draft.update(name, (agent) => {
+              agent.model = ref
+            })
+          }
 
-        for (const definition of active.agents) {
-          next.add(definition.name)
-          draft.update(definition.name, (agent) => {
-            agent.name = Agent.Name.make(definition.name)
-            agent.hidden = false
-            if (definition.description) agent.description = definition.description
-            const mode = agentMode(definition.mode)
-            if (mode) agent.mode = mode
-            if (definition.system) agent.system = definition.system
-            const ref = parseModelRef(definition.model ?? "")
-            if (ref) agent.model = ref
-          })
-        }
-
-        for (const { agent: name, model } of active.agentModels) {
-          // Config model overrides target agents that already exist, or that this
-          // profile ships a definition for. Never invent a nameless stub.
-          const ref = parseModelRef(model)
-          if (!ref) continue
-          if (!draft.get(name) && !fromFiles.has(name)) continue
-          next.add(name)
-          draft.update(name, (agent) => {
-            agent.model = ref
-          })
-        }
-
-        // Hide disabled agents instead of removing them: a session already bound
-        // to one would otherwise die with Session.AgentNotFoundError on its next
-        // turn. Hidden agents stay resolvable but drop out of the picker
-        // (opencode core: selectable = mode !== "subagent" && !hidden).
-        for (const name of active.disabledAgents) {
-          if (draft.get(name))
+          // Hide disabled agents instead of removing them: a session already
+          // bound to one would otherwise die with Session.AgentNotFoundError on
+          // its next turn. Hidden agents stay resolvable but drop out of the
+          // picker (opencode core: selectable = mode !== "subagent" && !hidden).
+          for (const name of active.disabledAgents) {
+            if (!draft.get(name)) continue
             draft.update(name, (agent) => {
               agent.hidden = true
             })
+          }
+
+          if (active.defaultAgent) draft.default(active.defaultAgent)
         }
-        if (active.defaultAgent) draft.default(active.defaultAgent)
-        created = next
+
+        // A session may still be bound to another profile's agent, and those
+        // names exist nowhere else — keep one resolvable as a hidden stub so the
+        // session survives, while selection and the picker ignore it.
+        for (const name of staleAgentNames(profiles, active)) {
+          if (draft.get(name)) continue
+          draft.update(name, (agent) => {
+            agent.name = Agent.Name.make(name)
+            agent.mode = "subagent"
+            agent.hidden = true
+          })
+        }
       }),
     )
 

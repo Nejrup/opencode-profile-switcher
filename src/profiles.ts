@@ -602,6 +602,8 @@ export type Profile = {
   configFile: string
   config: any
   agents: AgentDefinition[]
+  /** Agent names this profile declares: `.md` files plus `agents` config keys. */
+  declaredAgents: string[]
   disabledAgents: string[]
   agentModels: Array<{ agent: string; model: string }>
   defaultAgent?: string
@@ -640,6 +642,60 @@ export function startupInfo(configFile: string, relaunch: string[], env?: string
     keys: relaunch,
     command: `OPENCODE_CONFIG=${JSON.stringify(configFile)} opencode service restart`,
   }
+}
+
+/**
+ * Agent names that other profiles declare but the active one does not. Sessions
+ * can still be bound to them, and a transform that simply stops registering an
+ * agent makes it disappear, so the server keeps a hidden stub alive for each.
+ * Names the base config already defines are excluded by the caller: those agents
+ * have to come back untouched when a profile is removed.
+ */
+export function staleAgentNames(
+  profiles: Array<{ declaredAgents: string[] }>,
+  active?: { declaredAgents: string[] },
+): string[] {
+  const owned = new Set(active?.declaredAgents ?? [])
+  const out: string[] = []
+  for (const profile of profiles) {
+    for (const name of profile.declaredAgents) {
+      if (owned.has(name) || out.includes(name)) continue
+      out.push(name)
+    }
+  }
+  return out
+}
+
+// --- restart policy --------------------------------------------------------
+
+export type RestartPolicy = "ask" | "always" | "never"
+
+/** Reads the durable preference, including the pre-1.4 boolean `askRestart`. */
+export function normalizeRestartPolicy(stored: Record<string, unknown> | undefined): RestartPolicy {
+  const value = stored?.restartPolicy
+  if (value === "ask" || value === "always" || value === "never") return value
+  if (stored?.askRestart === false) return "never"
+  if (stored?.askRestart === true) return "ask"
+  return "ask"
+}
+
+export function nextRestartPolicy(current: RestartPolicy): RestartPolicy {
+  return current === "ask" ? "always" : current === "always" ? "never" : "ask"
+}
+
+/**
+ * Environment for `opencode service restart`: the profile file layered in, or no
+ * layering at all when returning to base config — which is the only way to
+ * *remove* plugins, providers and friends a previous profile added.
+ */
+export function restartEnv(
+  configFile: string | null,
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string | undefined> {
+  const next = { ...env }
+  if (configFile) next.OPENCODE_CONFIG = configFile
+  else delete next.OPENCODE_CONFIG
+  return next
 }
 
 /** One-line label for a profile whose startup keys are not loaded yet. */
@@ -707,6 +763,8 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
     // a V1 shape is not read here; classifyConfig reports it instead.
     const agents: Record<string, any> = config.agents ?? {}
     const warnings = classifyConfig(config)
+    const agentFiles = readAgents(directory)
+    const declaredAgents = [...new Set([...agentFiles.map((definition) => definition.name), ...Object.keys(agents)])]
 
     found.push({
       name: entry.name,
@@ -716,7 +774,8 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
       directory,
       configFile: file,
       config,
-      agents: readAgents(directory),
+      agents: agentFiles,
+      declaredAgents,
       disabledAgents: Object.entries(agents)
         .filter(([, agent]) => agent?.disabled === true)
         .map(([name]) => name),

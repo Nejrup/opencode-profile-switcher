@@ -69,10 +69,20 @@ so the watcher path needs no restart.
   unknown (verified against a running server). That is what makes live agent
   loading possible — and why an unknown name is never passed to it: it would
   produce a prompt-less stub.
-- **Hide, never remove.** Disabling or retiring an agent sets `hidden = true`.
-  Removal orphans sessions bound to it (`Session.AgentNotFoundError`). A hidden
-  agent stays resolvable but drops out of selection (`selectable = mode !==
-  "subagent" && !hidden` in core).
+- **Hide, never remove — and never remember having hidden.** Disabling an agent
+  sets `hidden = true`; removal orphans sessions bound to it
+  (`Session.AgentNotFoundError`), and a hidden agent stays resolvable but drops
+  out of selection (`selectable = mode !== "subagent" && !hidden` in core).
+  Visibility must be *derived* in every replay, not tracked in a set: `reload()`
+  rebuilds from a fresh base, so a hide applied from stale state persists one
+  replay too many. That was the 1.3.x bug — `created` collected base agents whose
+  model a profile overrode, `/profile none` hid `build`, nothing un-hid it, and
+  `switchAgent("build")` could no longer restore the session.
+- **Retiring another profile's agents uses hidden stubs.** `staleAgentNames(
+  profiles, active)` lists names declared by some profile but not the active one;
+  the transform registers each as a hidden `subagent` **only when nothing else
+  defines it** (`draft.get(name)` empty). Names the base config or project
+  provides are skipped, which is exactly why they come back intact on revert.
 - **Reference paths resolve against the profile directory, on purpose.** V2 core
   resolves a project's relative `references` against the project; here they are
   rewritten to absolute against `<config>/profiles/<name>/` because that is the
@@ -193,7 +203,13 @@ its own environment:
   correct because needing a restart depends on the profile, not the process)
 - `context.storage.memory` holds that verdict for the badge and dialog (ephemeral
   by design); `context.storage.store` holds the durable profile name and the
-  `askRestart` preference
+  `restartPolicy` preference
+- `restartPolicy` is `"ask" | "always" | "never"` (`normalizeRestartPolicy` still
+  reads the 1.3 boolean `askRestart`, and `nextRestartPolicy` cycles the three).
+  Under `always` the TUI restarts on *every* switch, including back to base, and
+  `restartEnv(null)` strips `OPENCODE_CONFIG` — that is the only way a profile's
+  `plugins` / `providers` get removed again. Never mutate the caller's env object:
+  `restartEnv` copies, which is what the test asserts.
 - restart: `spawn(cliBinary(), ["service", "restart"], { env: { ...process.env,
   OPENCODE_CONFIG: profile.configFile }, detached: true, stdio: "ignore" })`.
   `service restart` in turn spawns the daemon with `{ ...process.env, ...extra }`,
