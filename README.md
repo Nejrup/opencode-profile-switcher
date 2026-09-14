@@ -80,7 +80,7 @@ entry from both lists and re-run the install above.
 
 ```sh
 opencode plugin remove github:Nejrup/opencode-profile-switcher
-# then remove the spec from cli.json `plugins`; plugin remove only touches the server list
+# 2.0.3 removes the spec from opencode.jsonc and cli.json; check cli.json either way
 ```
 
 ### Why a package spec, not a path
