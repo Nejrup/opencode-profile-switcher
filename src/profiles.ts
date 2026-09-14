@@ -304,6 +304,61 @@ export function mcpServers(config: any): Record<string, any> {
   return out
 }
 
+// --- references ------------------------------------------------------------
+
+export type ReferenceSource =
+  | { type: "local"; path: string; description?: string; hidden?: boolean }
+  | { type: "git"; repository: string; branch?: string; description?: string; hidden?: boolean }
+
+/**
+ * V2 `references` entries declare a local path or a git repository without a
+ * `type`; the source shape the editor wants adds one. Relative paths are
+ * resolved against the *profile directory*, because that is the file that
+ * declares them — a profile moved between machines keeps working, and `~` is
+ * expanded the way config paths usually are.
+ */
+export function referenceSources(config: any, directory: string): Record<string, ReferenceSource> {
+  const entries = config?.references
+  if (!entries || typeof entries !== "object" || Array.isArray(entries)) return {}
+  const out: Record<string, ReferenceSource> = {}
+  for (const [name, value] of Object.entries(entries as Record<string, any>)) {
+    if (!value || typeof value !== "object") continue
+    const description = typeof value.description === "string" ? value.description : undefined
+    const hidden = value.hidden === true ? true : undefined
+    if (typeof value.repository === "string" && value.repository !== "") {
+      out[name] = {
+        type: "git",
+        repository: value.repository,
+        ...(typeof value.branch === "string" && value.branch !== "" ? { branch: value.branch } : {}),
+        ...(description ? { description } : {}),
+        ...(hidden ? { hidden } : {}),
+      }
+      continue
+    }
+    if (typeof value.path === "string" && value.path !== "") {
+      const raw = value.path.startsWith("~/") ? path.join(os.homedir(), value.path.slice(2)) : value.path
+      out[name] = {
+        type: "local",
+        path: path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(directory, raw),
+        ...(description ? { description } : {}),
+        ...(hidden ? { hidden } : {}),
+      }
+    }
+  }
+  return out
+}
+
+// --- websearch -------------------------------------------------------------
+
+/** V2 accepts `false` (off) or `{ provider }`; anything else is not applied. */
+export function websearchSelection(config: any): string | false | undefined {
+  const value = config?.websearch
+  if (value === false) return false
+  if (value && typeof value === "object" && typeof value.provider === "string" && value.provider !== "")
+    return value.provider
+  return undefined
+}
+
 // --- field classification --------------------------------------------------
 //
 // The switcher only reads V2 shapes. At switch time it lints the profile config
@@ -345,7 +400,7 @@ const V2_TOP = new Set([
 ])
 
 /** Keys the switcher applies live through plugin transforms. */
-const APPLIED_LIVE = new Set(["agents", "default_agent", "model", "mcp", "permissions"])
+const APPLIED_LIVE = new Set(["agents", "default_agent", "model", "mcp", "permissions", "references", "websearch"])
 
 /** V1 keys that have a native V2 name, and still work while unconverted. */
 const ADAPTED_TOP: Record<string, string> = {
@@ -482,6 +537,17 @@ export function classifyConfig(config: any): ProfileWarnings {
 
   lintNested(config, warnings, "experimental", V2_EXPERIMENTAL, LEGACY_EXPERIMENTAL)
   lintNested(config, warnings, "compaction", new Set(["auto", "keep", "buffer"]), LEGACY_COMPACTION)
+
+  // references / websearch are applied live, so a malformed entry is worth naming.
+  for (const [name, value] of Object.entries((config.references ?? {}) as Record<string, any>)) {
+    if (!value || typeof value !== "object" || (typeof value.path !== "string" && typeof value.repository !== "string"))
+      warnings.unknown.push(`references.${name} — needs "path" or "repository"`)
+  }
+  if (config.websearch !== undefined && config.websearch !== false) {
+    const provider = (config.websearch as Record<string, unknown>)?.provider
+    if (typeof provider !== "string" || provider === "")
+      warnings.legacy.push('websearch — use { "provider": "<id>" } or false')
+  }
 
   // Provider entries keep the V1 shape easily; lint both container names.
   for (const key of ["providers", "provider"] as const) {

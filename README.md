@@ -23,49 +23,65 @@ schematic — picker and footer badge, not a screenshot
 
 | | |
 | --- | --- |
-| **Applies live** | default agent, per-agent models, agent `.md` definitions, default model, MCP servers, permission rules, per-agent generation tuning |
+| **Applies live** | default agent, per-agent models, agent `.md` definitions, default model, MCP servers, permission rules, named references, websearch provider, per-agent generation tuning |
 | **Reports** | which fields need a relaunch, which are V1-but-normalized, which V2 ignores — each with the fix |
 | **Writes** | nothing in your config; only the picker's own handoff file |
 
-OpenCode **2.x** only (V1 has no plugin API for this). Released under MIT.
+OpenCode **2.x** only (V1 has no plugin API for this). MIT licensed.
+
+<details>
+<summary>Contents</summary>
+
+- [Install](#install)
+- [Make a profile](#make-a-profile)
+- [Use](#use)
+- [What changes take effect](#what-changes-take-effect)
+- [It tells you when a profile is stale](#it-tells-you-when-a-profile-is-stale)
+- [Troubleshooting](#troubleshooting)
+- [Known limits](#known-limits)
+- [Development](#development)
+
+</details>
 
 ---
 
 ## Install
 
+```sh
+opencode plugin add github:Nejrup/opencode-profile-switcher   # server half
+```
+```jsonc
+// terminal half — ~/.config/opencode/cli.json
+{ "plugins": ["github:Nejrup/opencode-profile-switcher"] }
+```
+```sh
+opencode service restart                                      # both lists land
+```
+
+<details>
+<summary>Why three steps for one plugin</summary>
+
 Two edits and a restart, because the package has two halves: the **server** reads
 `plugins` in `opencode.json(c)`, the **terminal** reads `plugins` in
 `~/.config/opencode/cli.json`, and `plugin add` only writes the first.
 
-```sh
-# 1. server half
-opencode plugin add github:Nejrup/opencode-profile-switcher
-```
-
-```jsonc
-// 2. terminal half — ~/.config/opencode/cli.json
-{
-  "plugins": ["github:Nejrup/opencode-profile-switcher"],
-}
-```
-
-```sh
-# 3. let both lists land
-opencode service restart
-```
+</details>
 
 Check it took:
 
 ```sh
 opencode plugin list
 # ID                VERSION  SOURCE
-# profile-switcher  b311994  github:Nejrup/opencode-profile-switcher
+# profile-switcher  <sha>    github:Nejrup/opencode-profile-switcher
 ```
+
+Git installs report the resolved commit, which is why `opencode plugin check` is
+the better "am I current?" command — it prints Server and TUI rows side by side.
 
 Open the TUI, press `<leader>p` (leader defaults to `ctrl+x`, so `ctrl+x` then
 `p`), and the picker should list whatever is under `~/.config/opencode/profiles/`.
 
-> **Pin a version:** append a ref — `github:Nejrup/opencode-profile-switcher#v1.1.0`.
+> **Pin a version:** append a ref — `github:Nejrup/opencode-profile-switcher#v1.2.0`.
 > An unpinned spec tracks the default branch and `opencode plugin update` moves it;
 > exact versions and full commit hashes stay put and are skipped by update checks.
 
@@ -102,6 +118,10 @@ A profile is a directory with a config in it:
       "docs": { "type": "remote", "url": "https://mcp.example.com" },
     },
   },
+  "references": {
+    "handbook": { "path": "../shared/docs", "description": "Product behaviour" },
+  },
+  "websearch": { "provider": "random" },
 }
 ```
 
@@ -112,6 +132,14 @@ A profile is a directory with a config in it:
 `profile.jsonc` is cosmetic — drop it and the picker derives a summary from
 `default_agent` and `model`. Agent names in `agents` that have no `.md` file
 still get created, just without a prompt.
+
+Three profiles worth starting with:
+
+| Name it | Shape |
+| --- | --- |
+| `fast` | cheap default model, no per-agent overrides, research tools denied |
+| `deep` | frontier model, your own `agents/*.md`, `build` hidden so it plans first |
+| `review` | `edit` and `shell` denied, read-only docs MCP on |
 
 ## Use
 
@@ -139,9 +167,16 @@ in sync either way.
 | `model` | `catalog.transform` → `model.default.set()` |
 | `mcp.servers` | `mcp.transform` → `editor.set()` |
 | `permissions` | `permission.hook("evaluate")`, last-match-wins |
+| `references` | `reference.transform` → `editor.add()` |
+| `websearch` | `websearch.transform` → `default.set()` |
 | agent `temperature` / `reasoningEffort` / `textVerbosity` | `session.hook("context")` writing `event.options` |
 
-Two deliberate choices behind that:
+`references` entries take the V2 shorthand (`{ path }` or `{ repository, branch }`);
+relative paths resolve against **the profile directory**, so `"../docs"` means
+what it says where you wrote it. `websearch` accepts `{ "provider": "<id>" }` or
+`false` to turn search off.
+
+Two deliberate choices behind the table:
 
 - **Agents are hidden, never removed.** A session still bound to a removed agent
   dies with `Session.AgentNotFoundError` on its next turn, so anything a profile
@@ -151,17 +186,31 @@ Two deliberate choices behind that:
   caches are re-synced so it's visible without a relaunch.
 
 <details>
-<summary><b>Needs a relaunch instead</b> (the picker and <code>/profile</code> tell you which)</summary>
+<summary><b>Keys that need a restart instead</b> (the picker and <code>/profile</code> name them per profile)</summary>
 
-Everything else in the V2 key list has no runtime transform: `plugins`,
-`experimental`, `compaction`, `providers`, `lsp`, `formatter`, `instructions`,
-`skills`, `commands`, `references`, `watcher`, `media`, `tool_output`,
-`snapshots`, `worktree`, `warming`, `websearch`, `update`, `share`, `enterprise`,
-`username`, `shell`. Relaunch in the profile directory to apply those:
+Some settings are read once when a server starts and have no runtime transform in
+this plugin: `plugins`, `experimental`, `compaction`, `providers`, `lsp`,
+`formatter`, `instructions`, `skills`, `commands`, `watcher`, `media`,
+`tool_output`, `snapshots`, `worktree`, `warming`, `update`, `share`, `enterprise`,
+`username`, `shell`.
+
+A profile is **not** a launch target — `opencode <dir>` opens a *project* — so
+running with those values means making them part of a config a starting server
+actually reads:
 
 ```sh
-opencode ~/.config/opencode/profiles/deep
+# per project: let the project carry the profile
+ln -s ~/.config/opencode/profiles/deep/opencode.jsonc ~/work/repo/opencode.jsonc
+opencode ~/work/repo
+
+# everywhere else: fold those keys into <config>/opencode.jsonc, then
+opencode service restart
 ```
+
+Everything else in that profile still switches live; only these keys are
+startup-bound. `commands` and `providers` do have plugin transforms, but slash
+command template rendering and provider connection lifecycle belong to core — a
+profile overlay guessing at them would be worse than telling you to restart.
 
 </details>
 
@@ -173,8 +222,10 @@ config into five buckets, and `/profile <name>` prints the breakdown:
 ```text
 **deep** — `/Users/you/.config/opencode/profiles/deep`
 - default agent: `architect`
-- applied live: agents, default_agent, mcp, model, permissions
-- relaunch to apply: compaction — `opencode .../profiles/deep`
+- applied live: agents, default_agent, mcp, model, permissions, references
+- relaunch to apply: compaction — these are read at startup, so put them in a
+  launch-time config (the project you open, or <config>/opencode.jsonc) and run
+  `opencode service restart`
 - V1 but normalized by V2:
     - autoupdate — native form: "update": "disable" | "notify" | "auto"
 - legacy fields (ignored by V2):
@@ -209,7 +260,7 @@ rather than guessing at a translation.
 | `/plugins` shows a failure marker on it | resolved a bad copy, or you edited a local install | `opencode plugin update`; if it sticks, `rm -rf ~/.cache/opencode/npm/git-*profile-switcher-*` and re-add |
 | Applied a profile but agents/models did not change | profile uses V1 `agent:` / `permission:` keys | rename to `agents` / `permissions` — the switch report lists exactly which |
 | Agents appear with no prompt | `agents/<name>.md` missing or unreadable | add the file; the picker counts how many agents were loaded |
-| Profile changes a `plugins` or `compaction` key and nothing happens | those are startup-only | relaunch: `opencode <profile dir>` |
+| Profile changes a `plugins` or `compaction` key and nothing happens | those are read at startup | put them in the config the server reads when it starts — the project's `opencode.jsonc` or `<config>/opencode.jsonc` — then `opencode service restart` |
 | Two OpenCode windows disagree | the handoff file is global, one switch wakes every loaded location | intentional today; see [Limits](#known-limits) |
 
 ## Known limits
@@ -217,6 +268,10 @@ rather than guessing at a translation.
 - **The overlay is global, not per-location.** The handoff file is one file in the
   config dir, so a switch applies to every location the service has loaded; only
   session migration is ownership-checked.
+- **Twenty keys can't be swapped live** (`plugins`, `compaction`, `providers`,
+  `experimental`, …). They are read when a server starts, and a profile directory
+  is not a launch target — `opencode <dir>` opens a *project*. See
+  [What changes take effect](#what-changes-take-effect) for the two real recipes.
 - **A profile can tighten permissions but never loosen them.** The `evaluate` hook
   runs after the configured ruleset, and an explicit configured `deny` is final.
 - **Resource semantics belong to core.** Rules match `action` and `resource` globs
@@ -230,7 +285,7 @@ rather than guessing at a translation.
 ```sh
 bun install
 bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.x types
-bun test            # 24 tests: refs, permission precedence, field lint, frontmatter
+bun test            # 29 tests: refs, permission precedence, field lint, references, frontmatter
 ```
 
 Iterate without pushing: `./install.sh` registers this checkout with

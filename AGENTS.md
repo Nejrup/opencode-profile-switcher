@@ -73,6 +73,11 @@ so the watcher path needs no restart.
   Removal orphans sessions bound to it (`Session.AgentNotFoundError`). A hidden
   agent stays resolvable but drops out of selection (`selectable = mode !==
   "subagent" && !hidden` in core).
+- **Reference paths resolve against the profile directory, on purpose.** V2 core
+  resolves a project's relative `references` against the project; here they are
+  rewritten to absolute against `<config>/profiles/<name>/` because that is the
+  file that declares them, and `~` is expanded. Config shorthand (`{ path }` /
+  `{ repository }`) carries no `type`, which `referenceSources()` infers.
 - **Registry reads reflect every registration made so far**, including during
   setup; `reload()` replays transforms onto a fresh value, so transforms must be
   cheap, pure, and re-runnable — read external state *before* the callback.
@@ -89,8 +94,21 @@ so the watcher path needs no restart.
 ## The field classifier
 
 `classifyConfig` in `src/profiles.ts` buckets profile keys into `applied`,
-`relaunch`, `adapted`, `legacy`, `unknown`. The native key set must track the
-**contract the server serves**, not the published schema:
+`relaunch`, `adapted`, `legacy`, `unknown`. `applied` is the contract, not
+aspiration: it must match what the transforms in `src/index.ts` really do —
+currently `agents`, `default_agent`, `model`, `mcp`, `permissions`, `references`,
+`websearch`. `reloadAll()` reloads exactly those domains
+(`agent`, `catalog`, `mcp`, `reference`, `websearch`).
+
+Two keys have plugin transforms but are deliberately *not* applied: `commands`
+(slash-command template rendering — `$ARGUMENTS`, `$1`, attachments — is core's,
+and re-implementing it wrong is worse than a restart) and `providers` (a catalog
+transform changes the record, but the integration's connection lifecycle is not
+re-run from it, so a changed `baseURL` may not take effect — half-working is the
+worst outcome). Keep them in `relaunch`.
+
+The native key set must track the **contract the server serves**, not the
+published schema:
 
 ```sh
 opencode api get /openapi.json   # components.schemas.Config.InfoEncoded (28 props)

@@ -6,8 +6,10 @@ import {
   mcpServers,
   parseAgentMarkdown,
   parseModelRef,
+  referenceSources,
   resolveEffect,
   toPermissionRules,
+  websearchSelection,
 } from "../src/profiles.ts"
 
 describe("parseModelRef", () => {
@@ -124,8 +126,15 @@ describe("classifyConfig", () => {
       websearch: { provider: "random" },
       enterprise: { url: "https://x" },
     })
-    expect(w.applied.sort()).toEqual(["agents", "default_agent", "mcp", "model", "permissions"])
-    expect(w.relaunch.sort()).toEqual(["compaction", "enterprise", "providers", "update", "websearch", "worktree"])
+    expect(w.applied.sort()).toEqual([
+      "agents",
+      "default_agent",
+      "mcp",
+      "model",
+      "permissions",
+      "websearch",
+    ])
+    expect(w.relaunch.sort()).toEqual(["compaction", "enterprise", "providers", "update", "worktree"])
     expect(w.legacy).toEqual([])
     expect(w.unknown).toEqual([])
     expect(w.adapted).toEqual([])
@@ -184,6 +193,16 @@ describe("classifyConfig", () => {
     expect(w.legacy).toEqual(expect.arrayContaining([expect.stringContaining("skills — combine")]))
   })
 
+  test("names malformed references and websearch entries", () => {
+    const w = classifyConfig({
+      references: { good: { path: "/x" }, bad: { description: "no source" } },
+      websearch: "exa",
+    })
+    expect(w.applied).toEqual(expect.arrayContaining(["references", "websearch"]))
+    expect(w.unknown).toEqual(expect.arrayContaining(['references.bad — needs "path" or "repository"']))
+    expect(w.legacy).toEqual(expect.arrayContaining(['websearch — use { "provider": "<id>" } or false']))
+  })
+
   test("an empty config produces no warnings", () => {
     expect(classifyConfig({})).toEqual({ applied: [], relaunch: [], adapted: [], legacy: [], unknown: [] })
     expect(classifyConfig(undefined).applied).toEqual([])
@@ -225,6 +244,56 @@ describe("mcpServers", () => {
     expect(Object.keys(servers)).toEqual(["ok"])
     expect(mcpServers({ mcp: { docs: { type: "remote", url: "https://x" } } })).toEqual({})
     expect(mcpServers({})).toEqual({})
+  })
+})
+
+describe("referenceSources", () => {
+  const root = "/home/you/.config/opencode/profiles/deep"
+
+  test("infers local and git sources from the shorthand config shape", () => {
+    const sources = referenceSources(
+      {
+        references: {
+          docs: { path: "/workspace/product-docs", description: "Product behaviour" },
+          spec: { repository: "acme/standards", branch: "main", hidden: true },
+        },
+      },
+      root,
+    )
+    expect(sources.docs).toEqual({ type: "local", path: "/workspace/product-docs", description: "Product behaviour" })
+    expect(sources.spec).toEqual({ type: "git", repository: "acme/standards", branch: "main", hidden: true })
+  })
+
+  test("resolves relative paths against the profile directory and expands ~", async () => {
+    const os = await import("node:os")
+    const nodePath = await import("node:path")
+    const sources = referenceSources({ references: { shared: { path: "../docs" }, dot: { path: "~/notes" } } }, root)
+    expect(sources.shared?.type === "local" && sources.shared.path).toBe(
+      "/home/you/.config/opencode/profiles/docs",
+    )
+    expect(sources.dot?.type === "local" && sources.dot.path).toBe(
+      nodePath.join(os.homedir(), "notes"),
+    )
+  })
+
+  test("skips entries with neither path nor repository", () => {
+    const sources = referenceSources(
+      { references: { ok: { path: "/x" }, nope: { description: "nothing" }, str: "text", empty: { path: "" } } },
+      root,
+    )
+    expect(Object.keys(sources)).toEqual(["ok"])
+    expect(referenceSources({}, root)).toEqual({})
+    expect(referenceSources({ references: ["x"] }, root)).toEqual({})
+  })
+})
+
+describe("websearchSelection", () => {
+  test("reads the provider id, false to disable, and nothing else", () => {
+    expect(websearchSelection({ websearch: { provider: "random" } })).toBe("random")
+    expect(websearchSelection({ websearch: false })).toBe(false)
+    expect(websearchSelection({ websearch: { provider: "" } })).toBeUndefined()
+    expect(websearchSelection({ websearch: "exa" })).toBeUndefined()
+    expect(websearchSelection({})).toBeUndefined()
   })
 })
 

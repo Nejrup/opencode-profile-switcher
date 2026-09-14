@@ -28,8 +28,10 @@ import {
   readBaseConfig,
   readSelection,
   readSelectionState,
+  referenceSources,
   resolveEffect,
   stateFile,
+  websearchSelection,
   writeSelection,
   type Profile,
 } from "./profiles.ts"
@@ -53,7 +55,13 @@ export default Plugin.define({
     }
 
     const reloadAll = async () => {
-      await Promise.all([ctx.agent.reload(), ctx.catalog.reload(), ctx.mcp.reload()])
+      await Promise.all([
+        ctx.agent.reload(),
+        ctx.catalog.reload(),
+        ctx.mcp.reload(),
+        ctx.reference.reload(),
+        ctx.websearch.reload(),
+      ])
     }
 
     const select = (name: string | null) => {
@@ -227,6 +235,24 @@ export default Plugin.define({
       }),
     )
 
+    // Named references: replayed onto a fresh registry, so the previous
+    // profile's entries disappear without any bookkeeping here.
+    registrations.push(
+      await ctx.reference.transform((draft) => {
+        if (!active) return
+        for (const [name, source] of Object.entries(referenceSources(active.config, active.directory)))
+          draft.add(name, source)
+      }),
+    )
+
+    // websearch is selection only: an id, or false to turn it off.
+    registrations.push(
+      await ctx.websearch.transform((draft) => {
+        const selection = active ? websearchSelection(active.config) : undefined
+        if (selection !== undefined) draft.default.set(selection)
+      }),
+    )
+
     // --- permissions -------------------------------------------------------
     // There is no ruleset transform, so the profile's permissions are enforced
     // per decision through the evaluate hook, which runs after the configured
@@ -285,7 +311,9 @@ export default Plugin.define({
       if (profile.agents.length) lines.push(`- agents: ${profile.agents.map((a) => a.name).join(", ")}`)
       if (w.applied.length) lines.push(`- applied live: ${w.applied.join(", ")}`)
       if (w.relaunch.length)
-        lines.push(`- relaunch to apply: ${w.relaunch.join(", ")} — \`opencode ${profile.directory}\``)
+        lines.push(
+          `- relaunch to apply: ${w.relaunch.join(", ")} — these are read at startup, so put them in a launch-time config (the project you open, or <config>/opencode.jsonc) and run \`opencode service restart\``,
+        )
       if (w.adapted.length) lines.push(`- V1 but normalized by V2:\n${w.adapted.map((l) => `    - ${l}`).join("\n")}`)
       if (w.legacy.length) lines.push(`- legacy fields (ignored by V2):\n${w.legacy.map((l) => `    - ${l}`).join("\n")}`)
       if (w.unknown.length) lines.push(`- unrecognized fields (ignored): ${w.unknown.join(", ")}`)
