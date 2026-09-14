@@ -24,7 +24,7 @@ schematic — picker, restart prompt and footer badge, not a screenshot
   │                                              │
   │ OPENCODE_CONFIG=…/profiles/deep/opencode.jsonc│
   │ Sessions keep their history; a running turn   │
-  │ is interrupted.                               │
+  │ is never interrupted — the restart waits.     │
   │                     ⟨ Restart service ⟩  Not now
   └───────────────────────────────────────────────┘
 
@@ -34,7 +34,7 @@ schematic — picker, restart prompt and footer badge, not a screenshot
 | | |
 | --- | --- |
 | **Applies live** | default agent, per-agent models, agent `.md` definitions, default model, MCP servers, permission rules, named references, websearch provider, per-agent generation tuning |
-| **Marks & offers** | `⟳ needs restart` on profiles whose keys are startup-bound, and a one-keystroke restart that applies them for real |
+| **Marks & restarts** | `⟳ needs restart` on startup-bound profiles, and a service restart that layers the profile in — queued, never on top of a running turn |
 | **Reports** | which fields are V1-but-normalized, which V2 ignores — each with the fix |
 | **Writes** | nothing in your config; only the picker's own handoff file |
 
@@ -218,15 +218,18 @@ the service *with the profile layered in*, which applies those keys for real:
 
 - the picker, the footer badge and `/profile` mark such profiles
   **`⟳ needs restart (2)`**
-- right after you apply one, a dialog asks: **Restart the service?** — confirming
-  runs `opencode service restart` with `OPENCODE_CONFIG=<profile>/opencode.jsonc`
-- the marker then reads **`✓ startup loaded`**, and `/profile` says so too
-- three restart policies, cycled from the palette (**"Profile restart policy: …"**):
+- by default the plugin **restarts on every switch**, and never on top of a
+  running turn: if something is executing, the restart is queued and fires on
+  `session.idle` (or when that turn fails / is interrupted)
+- the restart runs `opencode service restart` with
+  `OPENCODE_CONFIG=<profile>/opencode.jsonc`; the marker then reads
+  **`✓ startup loaded`**, and `/profile` says so too
+- three policies, cycled from the palette (**"Profile restart policy: …"**):
 
   | Policy | Behaviour |
   | --- | --- |
-  | **ask** *(default)* | `⟳` marker + a confirmation dialog after you apply a profile that needs it |
-  | **always** | every switch restarts the service with the new profile layered in — and switching back to base restarts **without** it, so `plugins`, `providers` and friends a profile added actually go away. Cost: a service bounce per switch, so a running turn is always interrupted |
+  | **always** *(default)* | every switch bounces the service with the new profile layered in — and switching back to base bounces it **without** the layer, so `plugins`, `providers` and friends a profile added actually go away. Deferred while any turn is running |
+  | **ask** | `⟳` marker plus a confirmation dialog when the profile has startup-only keys |
   | **never** | marker and a toast with the command only; you restart yourself |
 
 - at any time: palette → **"Restart service with profile"** (enabled only while
@@ -240,7 +243,8 @@ the layered profile file added.
 What a restart costs you:
 
 - sessions, messages and history live in the database — they survive
-- **a running turn is interrupted**, so let long work finish first
+- **no turn is interrupted**: a restart triggered while anything is running is
+  queued and fires when that turn ends; the `⟳` marker stays until it does
 - if the terminal doesn't reconnect on its own, relaunch `opencode`
 - only the restarted service carries the layered config; other `opencode`
   commands you run yourself need the variable set explicitly
@@ -320,9 +324,10 @@ rather than guessing at a translation.
 | `/plugins` shows a failure marker on it | resolved a bad copy, or you edited a local install | `opencode plugin update`; if it sticks, `rm -rf ~/.cache/opencode/npm/git-*profile-switcher-*` and re-add |
 | Applied a profile but agents/models did not change | profile uses V1 `agent:` / `permission:` keys | rename to `agents` / `permissions` — the switch report lists exactly which |
 | Agents appear with no prompt | `agents/<name>.md` missing or unreadable | add the file; the picker counts how many agents were loaded |
-| Profile sets `plugins` / `compaction` and nothing moves | those are read at server start | apply the profile and confirm the restart prompt, or palette → "Restart service with profile" |
+| Profile sets `plugins` / `compaction` and nothing moves | those are read at server start | with the default **always** policy the service bounces for you; palette → "Restart service with profile" to force it, or `/profile restart` for the command |
+| Switched profiles but no restart happened | a turn was running, so the restart is **queued** | it fires when that turn ends (`session.idle`); the `⟳` marker stays until it does |
 | `⟳ needs restart` will not become `✓ startup loaded` | the service was started without the layered config | restart from the picker (it sets `OPENCODE_CONFIG`), or run the command `/profile restart` prints |
-| Restart prompt never appears | it is set to label-only | palette → "Profile restart prompt: ask" |
+| Restart prompt never appears | the policy is **always** (restarts without asking) or **never** (label only) | palette → "Profile restart policy" to cycle ask / always / never |
 | Terminal stops responding after a restart | the client did not rediscover the service | relaunch `opencode` — sessions and history are on disk |
 | `could not restart the service` toast | the CLI is not the running binary (wrapper, `bun`, a shim) | set `OPENCODE_BIN` to the real `opencode` executable |
 | Two OpenCode windows disagree | the handoff file is global, one switch wakes every loaded location | intentional today; see [Limits](#known-limits) |
@@ -354,7 +359,7 @@ rather than guessing at a translation.
 ```sh
 bun install
 bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.x types
-bun test            # 44 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter
+bun test            # 47 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter
 ```
 
 Iterate without pushing: `./install.sh` registers this checkout with

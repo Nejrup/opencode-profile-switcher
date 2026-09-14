@@ -679,6 +679,24 @@ export function normalizeRestartPolicy(stored: Record<string, unknown> | undefin
   return "ask"
 }
 
+/**
+ * Effective policy, including the 1.5 change of default to `always`.
+ *
+ * Before 1.5 the stored default was `ask`, so a stored `ask` from an older
+ * install is indistinguishable from never having chosen anything: only an
+ * explicit `always` / `never` (or the old `askRestart: false`) survives the
+ * upgrade. Writing `policyVersion` on the first explicit choice pins it.
+ */
+export const POLICY_VERSION = 2
+
+export function resolveRestartPolicy(stored: Record<string, unknown> | undefined): RestartPolicy {
+  if (stored?.policyVersion === POLICY_VERSION) return normalizeRestartPolicy(stored)
+  if (stored?.askRestart === false) return "never"
+  const explicit = stored?.restartPolicy
+  if (explicit === "always" || explicit === "never") return explicit
+  return "always"
+}
+
 export function nextRestartPolicy(current: RestartPolicy): RestartPolicy {
   return current === "ask" ? "always" : current === "always" ? "never" : "ask"
 }

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import {
+  POLICY_VERSION,
   agentMode,
   classifyConfig,
   cliBinary,
@@ -11,6 +12,7 @@ import {
   parseModelRef,
   referenceSources,
   restartEnv,
+  resolveRestartPolicy,
   resolveEffect,
   staleAgentNames,
   startupInfo,
@@ -391,6 +393,26 @@ describe("restart policy", () => {
     expect(nextRestartPolicy("ask")).toBe("always")
     expect(nextRestartPolicy("always")).toBe("never")
     expect(nextRestartPolicy("never")).toBe("ask")
+  })
+
+  test("1.5 defaults to always when the stored value is an older default", () => {
+    expect(resolveRestartPolicy(undefined)).toBe("always")
+    expect(resolveRestartPolicy({})).toBe("always")
+    // pre-1.5 wrote "ask" as the default, which is not a choice
+    expect(resolveRestartPolicy({ restartPolicy: "ask" })).toBe("always")
+    expect(resolveRestartPolicy({ policyVersion: 1, restartPolicy: "ask" })).toBe("always")
+  })
+
+  test("an explicit choice survives the default change", () => {
+    expect(resolveRestartPolicy({ askRestart: false })).toBe("never")
+    expect(resolveRestartPolicy({ restartPolicy: "never" })).toBe("never")
+    expect(resolveRestartPolicy({ restartPolicy: "always" })).toBe("always")
+  })
+
+  test("versioned preferences are authoritative", () => {
+    expect(resolveRestartPolicy({ policyVersion: POLICY_VERSION, restartPolicy: "ask" })).toBe("ask")
+    expect(resolveRestartPolicy({ policyVersion: POLICY_VERSION, restartPolicy: "never" })).toBe("never")
+    expect(resolveRestartPolicy({ policyVersion: POLICY_VERSION })).toBe("ask")
   })
 
   test("reverting to base must not inherit the layered file", () => {

@@ -28,14 +28,15 @@ import path from "node:path"
 import { Plugin } from "@opencode/plugin/tui"
 
 import {
+  POLICY_VERSION,
   cliBinary,
   loadProfiles,
   nextRestartPolicy,
-  normalizeRestartPolicy,
   profilesRoot,
   readSelection,
   readSelectionState,
   restartEnv,
+  resolveRestartPolicy,
   startupInfo,
   stateFile,
   writeSelection,
@@ -62,16 +63,22 @@ export default Plugin.define({
       initial: { name: readSelection() },
     })
 
-    // `askRestart` is the pre-1.4 shape of this preference; keep it readable so
-    // existing installs keep their choice, mapped onto the new policy.
+    // Policy default is `always` from 1.5 on. `askRestart` is the pre-1.4 shape
+    // and `restartPolicy: "ask"` was the pre-1.5 default, so a stored `ask` with
+    // no `policyVersion` is treated as "never chose" (see resolveRestartPolicy).
     const [prefs, setPrefs] = context.storage.store<{
+      policyVersion?: number
       askRestart?: boolean
       restartPolicy?: RestartPolicy
     }>("preferences", {
-      initial: { restartPolicy: "ask" },
+      initial: { policyVersion: POLICY_VERSION, restartPolicy: "always" },
     })
     const policy = (): RestartPolicy =>
-      normalizeRestartPolicy({ askRestart: prefs.askRestart, restartPolicy: prefs.restartPolicy })
+      resolveRestartPolicy({
+        policyVersion: prefs.policyVersion,
+        askRestart: prefs.askRestart,
+        restartPolicy: prefs.restartPolicy,
+      })
 
     // The server's verdict about startup-only keys, echoed through the handoff
     // file — only the server process knows its own OPENCODE_CONFIG.
@@ -209,11 +216,71 @@ export default Plugin.define({
       }
     }
 
-    /**
-     * Wait for the server to echo its verdict into the handoff file. The server
-     * writes `startup`, the TUI's own write does not, so its presence means the
-     * server has caught up with this switch.
-     */
+    // --- deferred restart --------------------------------------------------
+    // A restart stops whatever the service is doing, so it never fires while a
+    // turn is running: it is queued and flushed on `session.idle`.
+
+    const [queue, setQueue] = context.storage.memory<{
+      pending: boolean
+      profile: string | null
+      file: string | null
+    }>("restart-queue", { initial: { pending: false, profile: null, file: null } })
+
+    const busy = (): boolean => {
+      try {
+        return context.data.session
+          .list()
+          .some((session) => {
+            try {
+              return context.data.session.status(session.id) === "running"
+            } catch {
+              return false
+            }
+          })
+      } catch {
+        return false
+      }
+    }
+
+    const clearQueue = () =>
+      setQueue((draft) => {
+        draft.pending = false
+        draft.profile = null
+        draft.file = null
+      })
+
+    const flushQueue = () => {
+      if (!queue.pending || busy()) return
+      const profile = queue.profile ? profiles().find((item) => item.name === queue.profile) : null
+      const file = queue.file
+      clearQueue()
+      // A profile deleted between switch and idle still has to un-layer itself.
+      restartWith(profile ?? (file ? ({ configFile: file, name: queue.profile ?? "" } as Profile) : null))
+    }
+
+    const requestRestart = (profile: Profile | null) => {
+      if (!busy()) {
+        restartWith(profile)
+        return
+      }
+      setQueue((draft) => {
+        draft.pending = true
+        draft.profile = profile?.name ?? null
+        draft.file = profile?.configFile ?? null
+      })
+      context.ui.toast.show({
+        title: "Profile",
+        message: profile
+          ? `will restart with ${profile.name} layered in when this turn finishes`
+          : "will restart with no profile layered in when this turn finishes",
+        variant: "info",
+        duration: 5000,
+      })
+    }
+
+    /** Wait for the server to echo its verdict into the handoff file. The server
+     *  writes `startup`, the TUI's own write does not, so its presence means the
+     *  server has caught up with this switch. */
     const waitForVerdict = async (profile: Profile, timeoutMs = 1500): Promise<StartupInfo> => {
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
@@ -234,13 +301,19 @@ export default Plugin.define({
      * `never` only leaves the marker and the command.
      */
     const offerRestart = async (profile: Profile | null) => {
-      if (policy() === "always") {
-        restartWith(profile)
+      const mode = policy()
+
+      // `always`: every switch lands as a fresh service, and reverting to base
+      // un-layers it. Nothing to do when the server already runs this layer.
+      if (mode === "always") {
+        if (profile && verdictFor(profile).kind === "layered") return
+        requestRestart(profile)
         return
       }
+
       if (!profile) return
 
-      if (policy() === "never") {
+      if (mode === "never") {
         const info = startupInfo(profile.configFile, profile.warnings.relaunch)
         if (info.kind === "pending" && info.command)
           context.ui.toast.show({
@@ -271,9 +344,10 @@ export default Plugin.define({
           message:
             `${profile.name} sets ${info.keys.join(", ")} — those keys are read when the server ` +
             "starts, so they are not applied yet.\n\n" +
-            "Restart now with this profile layered in?\n" +
+            "Restart with this profile layered in?\n" +
             `OPENCODE_CONFIG=${profile.configFile}\n\n` +
-            "Sessions keep their history. Anything running in this one is interrupted.",
+            "Sessions keep their history. If a turn is running, the restart waits " +
+            "until it finishes instead of interrupting it.",
           label: { confirm: "Restart service", cancel: "Not now" },
         })) === true
       } catch (error) {
@@ -282,7 +356,7 @@ export default Plugin.define({
       }
 
       if (confirmed) {
-        restartWith(profile)
+        requestRestart(profile)
         return
       }
       context.ui.toast.show({
@@ -442,28 +516,29 @@ export default Plugin.define({
             },
             run: () => {
               const target = activeProfile()
-              if (target) restartWith(target)
+              if (target) requestRestart(target)
             },
           },
           {
             id: "profile-switcher.policy",
             title: `Profile restart policy: ${POLICY_LABEL[policy()]}`,
-            description: "Cycle: ask before restarting, always restart to apply the whole profile, or label only",
+            description: "Cycle: always restart to apply the whole profile, ask before restarting, or label only",
             group: "Profile",
             bind: false,
             palette: true,
             run: () => {
               const next = nextRestartPolicy(policy())
               setPrefs((draft) => {
+                draft.policyVersion = POLICY_VERSION
                 draft.restartPolicy = next
               })
               context.ui.toast.show({
                 title: "Profile",
                 message:
-                  next === "ask"
-                    ? "will ask before restarting the service"
-                    : next === "always"
-                      ? "every switch restarts the service, so plugins and providers swap both ways — running turns are interrupted"
+                  next === "always"
+                    ? "every switch restarts the service once nothing is running, so plugins and providers swap both ways"
+                    : next === "ask"
+                      ? "will ask before restarting the service"
                       : "will only mark profiles that need a restart — restart from the palette",
                 variant: next === "always" ? "warning" : "info",
                 duration: 5000,
@@ -499,7 +574,19 @@ export default Plugin.define({
 
     syncStartup()
 
+    // A queued restart fires the moment nothing is running. Execution end events
+    // are covered too, so a failed or interrupted turn cannot leave it stranded.
+    const unsubscribe = (
+      [
+        "session.idle",
+        "session.execution.succeeded",
+        "session.execution.failed",
+        "session.execution.interrupted",
+      ] as const
+    ).map((type) => context.data.on(type, () => flushQueue()))
+
     return () => {
+      for (const off of unsubscribe) off()
       removeSlot()
       unwatch()
     }

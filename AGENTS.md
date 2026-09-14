@@ -210,10 +210,29 @@ its own environment:
   `restartEnv(null)` strips `OPENCODE_CONFIG` — that is the only way a profile's
   `plugins` / `providers` get removed again. Never mutate the caller's env object:
   `restartEnv` copies, which is what the test asserts.
-- restart: `spawn(cliBinary(), ["service", "restart"], { env: { ...process.env,
-  OPENCODE_CONFIG: profile.configFile }, detached: true, stdio: "ignore" })`.
-  `service restart` in turn spawns the daemon with `{ ...process.env, ...extra }`,
-  which is why setting the variable on the spawn is enough.
+- restart: `spawn(cliBinary(), ["service", "restart"], { env: restartEnv(file),
+  detached: true, stdio: "ignore" })`. `service restart` in turn spawns the daemon
+  with `{ ...process.env, ...extra }`, which is why setting the variable on the
+  spawn is enough.
+- **a restart never fires on top of a running turn.** `requestRestart()` checks
+  `busy()` (any session whose `data.session.status` is `"running"`); if busy it
+  stores `{ pending, profile, file }` in a memory store and `flushQueue()` runs
+  from the `session.idle` / `session.execution.{succeeded,failed,interrupted}`
+  subscriptions. Both ends of that matter: idle alone would leave the queue
+  stranded after a failed turn, and the queue is per-TUI-instance by design (the
+  window that made the switch owns the restart).
+- `restartEnv(null)` **deletes** `OPENCODE_CONFIG` — that is how switching back to
+  base takes a profile's `plugins` / `providers` away again, and it is why
+  `switchTo()` records `wasLayered` before it clears the verdict: a base revert
+  only needs a bounce when something was layered.
+- **Default policy is `always` from 1.5.** Older installs persisted `ask` as their
+  default, which is indistinguishable from never having chosen, so
+  `resolveRestartPolicy()` ignores a stored `ask` unless `policyVersion` matches
+  `POLICY_VERSION`; only the old `askRestart: false` or an explicit
+  `always`/`never` carry over. Writing the policy from the palette stamps
+  `policyVersion`, so after that the value is authoritative — do not "simplify"
+  this back to reading `restartPolicy` directly, or the upgrade silently reverts
+  people who chose `never`.
 - `cliBinary()` prefers `process.execPath` when its basename starts with
   `opencode`, else falls back to `opencode` on `PATH`; `OPENCODE_BIN` overrides
   for wrappers. Keep it in `src/profiles.ts` — it is env/path logic and testable.
