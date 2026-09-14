@@ -33,6 +33,7 @@ import {
   loadProfiles,
   nextRestartPolicy,
   profilesRoot,
+  restartCommand,
   readSelection,
   readSelectionState,
   restartEnv,
@@ -181,11 +182,12 @@ export default Plugin.define({
         ? { kind: startup.kind, keys: startup.keys.length ? startup.keys : profile.warnings.relaunch, command: startup.command }
         : startupInfo(profile.configFile, profile.warnings.relaunch)
 
-    const restartWith = (profile: Profile | null) => {
-      const file = profile?.configFile ?? null
-      const command = profile
-        ? startupInfo(profile.configFile, profile.warnings.relaunch).command
-        : "opencode service restart"
+    /**
+     * Bounce the service with `file` layered in (null = un-layer). Takes the name
+     * and path rather than a Profile, because a queued restart may outlive the
+     * profile it was scheduled for.
+     */
+    const doRestart = (name: string | null, file: string | null) => {
       try {
         spawn(cliBinary(), ["service", "restart"], {
           env: restartEnv(file),
@@ -193,14 +195,14 @@ export default Plugin.define({
           stdio: "ignore",
         }).unref()
         setStartup((draft) => {
-          draft.profile = profile?.name ?? null
-          draft.kind = profile ? "layered" : "none"
+          draft.profile = name
+          draft.kind = name ? "layered" : "none"
           draft.keys = []
         })
         context.ui.toast.show({
           title: "Profile",
-          message: profile
-            ? `restarting with ${profile.name} layered in — relaunch opencode if the terminal does not reconnect`
+          message: name
+            ? `restarting with ${name} layered in — relaunch opencode if the terminal does not reconnect`
             : "restarting with no profile layered in — the previous profile's plugins and providers go away",
           variant: "info",
           duration: 6000,
@@ -209,12 +211,14 @@ export default Plugin.define({
         console.warn("[profile-switcher] restart failed", error)
         context.ui.toast.show({
           title: "Profile",
-          message: `could not restart the service — run: ${command ?? "opencode service restart"}`,
+          message: `could not restart the service — run: ${restartCommand(file)}`,
           variant: "error",
           duration: 8000,
         })
       }
     }
+
+    const restartWith = (profile: Profile | null) => doRestart(profile?.name ?? null, profile?.configFile ?? null)
 
     // --- deferred restart --------------------------------------------------
     // A restart stops whatever the service is doing, so it never fires while a
@@ -251,11 +255,11 @@ export default Plugin.define({
 
     const flushQueue = () => {
       if (!queue.pending || busy()) return
-      const profile = queue.profile ? profiles().find((item) => item.name === queue.profile) : null
-      const file = queue.file
+      const { profile, file } = queue
       clearQueue()
-      // A profile deleted between switch and idle still has to un-layer itself.
-      restartWith(profile ?? (file ? ({ configFile: file, name: queue.profile ?? "" } as Profile) : null))
+      // The queued file is authoritative: a profile deleted between switch and
+      // idle still has to be layered in, or un-layered if it is gone.
+      doRestart(profile, file)
     }
 
     const requestRestart = (profile: Profile | null) => {

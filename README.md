@@ -359,7 +359,7 @@ rather than guessing at a translation.
 ```sh
 bun install
 bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.x types
-bun test            # 47 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter
+bun test            # 48 tests: refs, permission precedence, field lint, references, startup, agents, frontmatter
 ```
 
 Iterate without pushing: `./install.sh` registers this checkout with

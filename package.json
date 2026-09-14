@@ -1,6 +1,6 @@
 {
   "name": "opencode-profile-switcher",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Switch OpenCode config profiles live from the TUI — no config edits, no restart",
   "type": "module",
   "license": "MIT",

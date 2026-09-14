@@ -633,15 +633,18 @@ export type Profile = {
 export type StartupKind = "none" | "pending" | "layered"
 export type StartupInfo = { kind: StartupKind; keys: string[]; command?: string }
 
+/** The command a manual restart needs, layered or un-layered. */
+export function restartCommand(configFile: string | null): string {
+  return configFile
+    ? `OPENCODE_CONFIG=${JSON.stringify(configFile)} opencode service restart`
+    : "opencode service restart"
+}
+
 export function startupInfo(configFile: string, relaunch: string[], env?: string): StartupInfo {
   if (relaunch.length === 0) return { kind: "none", keys: [] }
   if (env !== undefined && env !== "" && path.resolve(env) === path.resolve(configFile))
     return { kind: "layered", keys: relaunch }
-  return {
-    kind: "pending",
-    keys: relaunch,
-    command: `OPENCODE_CONFIG=${JSON.stringify(configFile)} opencode service restart`,
-  }
+  return { kind: "pending", keys: relaunch, command: restartCommand(configFile) }
 }
 
 /**

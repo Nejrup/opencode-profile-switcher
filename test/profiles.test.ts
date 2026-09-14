@@ -11,6 +11,7 @@ import {
   parseAgentMarkdown,
   parseModelRef,
   referenceSources,
+  restartCommand,
   restartEnv,
   resolveRestartPolicy,
   resolveEffect,
@@ -413,6 +414,14 @@ describe("restart policy", () => {
     expect(resolveRestartPolicy({ policyVersion: POLICY_VERSION, restartPolicy: "ask" })).toBe("ask")
     expect(resolveRestartPolicy({ policyVersion: POLICY_VERSION, restartPolicy: "never" })).toBe("never")
     expect(resolveRestartPolicy({ policyVersion: POLICY_VERSION })).toBe("ask")
+  })
+
+  test("restartCommand covers both directions", () => {
+    expect(restartCommand("/p/deep/opencode.jsonc")).toBe(
+      'OPENCODE_CONFIG="/p/deep/opencode.jsonc" opencode service restart',
+    )
+    // no file means the layer has to go, and the bare command does exactly that
+    expect(restartCommand(null)).toBe("opencode service restart")
   })
 
   test("reverting to base must not inherit the layered file", () => {
