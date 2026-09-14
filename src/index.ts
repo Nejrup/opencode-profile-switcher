@@ -30,6 +30,7 @@ import {
   readSelectionState,
   referenceSources,
   resolveEffect,
+  startupInfo,
   stateFile,
   websearchSelection,
   writeSelection,
@@ -143,10 +144,10 @@ export default Plugin.define({
     }
 
     const apply = async (name: string | null, sessionID?: string) => {
-      writeSelection(name, sessionID)
       previous = active?.name ?? previous
       await refresh()
       select(name)
+      writeSelection(name, sessionID, active ? startupInfo(active.configFile, active.warnings.relaunch, process.env.OPENCODE_CONFIG) : undefined)
       await reloadAll()
       await migrateSession(sessionID)
     }
@@ -310,9 +311,11 @@ export default Plugin.define({
       if (profile.defaultModel) lines.push(`- default model: \`${profile.defaultModel}\``)
       if (profile.agents.length) lines.push(`- agents: ${profile.agents.map((a) => a.name).join(", ")}`)
       if (w.applied.length) lines.push(`- applied live: ${w.applied.join(", ")}`)
-      if (w.relaunch.length)
+      const startup = startupInfo(profile.configFile, w.relaunch, process.env.OPENCODE_CONFIG)
+      if (startup.kind === "layered") lines.push(`- startup keys loaded: ${startup.keys.join(", ")}`)
+      if (startup.kind === "pending")
         lines.push(
-          `- relaunch to apply: ${w.relaunch.join(", ")} — these are read at startup, so put them in a launch-time config (the project you open, or <config>/opencode.jsonc) and run \`opencode service restart\``,
+          `- ⟳ needs a restart — ${startup.keys.join(", ")} are read when the server starts:\n    ${startup.command}\n    (the terminal picker can run this for you, or use /profile restart)`,
         )
       if (w.adapted.length) lines.push(`- V1 but normalized by V2:\n${w.adapted.map((l) => `    - ${l}`).join("\n")}`)
       if (w.legacy.length) lines.push(`- legacy fields (ignored by V2):\n${w.legacy.map((l) => `    - ${l}`).join("\n")}`)
@@ -337,6 +340,19 @@ export default Plugin.define({
       if (name === "" || name === "list" || name === "status") {
         if (!active) return respond(sessionID, `No profile applied — base config only.\n\n${listing()}`)
         return respond(sessionID, `Active profile: ${active.name}\n\n${report(active)}\n\n${listing()}`)
+      }
+
+      if (name === "restart") {
+        if (!active) return respond(sessionID, "No profile applied — nothing to layer in.")
+        const startup = startupInfo(active.configFile, active.warnings.relaunch, process.env.OPENCODE_CONFIG)
+        if (startup.kind === "layered")
+          return respond(sessionID, `Startup keys for **${active.name}** are already loaded (${startup.keys.join(", ")}).`)
+        if (startup.kind === "none")
+          return respond(sessionID, `**${active.name}** needs no restart — everything it sets applies live.`)
+        return respond(
+          sessionID,
+          `Restart the service with this profile layered in:\n\n    ${startup.command}\n\nThe terminal picker can run this for you. Sessions keep their history; the running turn is interrupted.`,
+        )
       }
 
       if (name === "none" || name === "clear" || name === "off") {

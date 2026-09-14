@@ -35,19 +35,34 @@ export function stateFile(): string {
   return path.join(globalConfigDir(), ".profile-switcher.json")
 }
 
-export function writeSelection(name: string | null, sessionID?: string): void {
+export function writeSelection(name: string | null, sessionID?: string, startup?: StartupInfo): void {
   const file = stateFile()
   fs.mkdirSync(path.dirname(file), { recursive: true })
   const body: Record<string, unknown> = { profile: name, at: Date.now() }
   if (sessionID) body.sessionID = sessionID
+  // The server's verdict on startup keys, echoed for the terminal half to read.
+  if (startup) body.startup = startup
   fs.writeFileSync(file, JSON.stringify(body), "utf8")
 }
 
-export function readSelectionState(): { profile: string | null; sessionID?: string } {
+export function readSelectionState(): {
+  profile: string | null
+  sessionID?: string
+  startup?: StartupInfo
+} {
   const parsed = readJsonc(stateFile())
+  const startup = parsed?.startup
   return {
     profile: typeof parsed?.profile === "string" ? parsed.profile : null,
     sessionID: typeof parsed?.sessionID === "string" ? parsed.sessionID : undefined,
+    startup:
+      startup && typeof startup === "object" && typeof startup.kind === "string"
+        ? {
+            kind: startup.kind as StartupKind,
+            keys: Array.isArray(startup.keys) ? startup.keys.map(String) : [],
+            command: typeof startup.command === "string" ? startup.command : undefined,
+          }
+        : undefined,
   }
 }
 
@@ -583,6 +598,8 @@ export type Profile = {
   description: string
   hidden: boolean
   directory: string
+  /** The config file this profile was read from — what OPENCODE_CONFIG points at. */
+  configFile: string
   config: any
   agents: AgentDefinition[]
   disabledAgents: string[]
@@ -596,6 +613,54 @@ export type Profile = {
   warnings: ProfileWarnings
   /** Valid V2 keys that only take effect on a relaunch (warnings.relaunch). */
   restartNeeded: string[]
+}
+
+// --- startup layering ------------------------------------------------------
+
+/**
+ * Keys that need a restart are read once when a server starts. A profile
+ * directory is not a launch target (`opencode <dir>` opens a *project*), but the
+ * server does read one extra config document from `OPENCODE_CONFIG`, merged
+ * above the global and project config — verified against a running 2.0.3 server.
+ * So restarting the service with `OPENCODE_CONFIG=<profile>/opencode.jsonc`
+ * applies the whole profile, including `plugins` and `providers`.
+ *
+ * Only the server knows its own environment, so the server writes this verdict
+ * into the handoff file and the terminal reads it back.
+ */
+export type StartupKind = "none" | "pending" | "layered"
+export type StartupInfo = { kind: StartupKind; keys: string[]; command?: string }
+
+export function startupInfo(configFile: string, relaunch: string[], env?: string): StartupInfo {
+  if (relaunch.length === 0) return { kind: "none", keys: [] }
+  if (env !== undefined && env !== "" && path.resolve(env) === path.resolve(configFile))
+    return { kind: "layered", keys: relaunch }
+  return {
+    kind: "pending",
+    keys: relaunch,
+    command: `OPENCODE_CONFIG=${JSON.stringify(configFile)} opencode service restart`,
+  }
+}
+
+/** One-line label for a profile whose startup keys are not loaded yet. */
+export function startupLabel(info: StartupInfo): string {
+  if (info.kind === "layered") return "✓ startup loaded"
+  if (info.kind === "pending") return `⟳ needs restart (${info.keys.length})`
+  return ""
+}
+
+/**
+ * The CLI used to bounce the shared background service. The TUI process *is* the
+ * opencode binary in normal use, so prefer it; `OPENCODE_BIN` overrides for
+ * wrappers that run the CLI through something else (bun, node, a shim).
+ */
+export function cliBinary(
+  env: Record<string, string | undefined> = process.env,
+  execPath: string = process.execPath,
+): string {
+  const configured = env.OPENCODE_BIN
+  if (configured && configured.trim() !== "") return configured
+  return path.basename(execPath).startsWith("opencode") ? execPath : "opencode"
 }
 
 const CONFIG_NAMES = ["opencode.jsonc", "opencode.json"]
@@ -649,6 +714,7 @@ export function loadProfiles(options: { includeHidden?: boolean } = {}): Profile
       description: String(meta.description ?? summarize(config)),
       hidden: meta.hidden === true,
       directory,
+      configFile: file,
       config,
       agents: readAgents(directory),
       disabledAgents: Object.entries(agents)

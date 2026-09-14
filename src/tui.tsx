@@ -2,6 +2,9 @@
  * profile-switcher — TUI half.
  *
  * Picker (`<leader>p`, palette) plus a footer badge showing the active profile.
+ * Profiles that set startup-only keys are marked `⟳ needs restart` / `✓ startup
+ * loaded`, and after applying one this half offers to bounce the shared service
+ * with the profile layered in through OPENCODE_CONFIG.
  * The CLI loads this module when the package is listed in `cli.json` `plugins`
  * and exposes the `./tui` entrypoint (see package.json `exports`).
  *
@@ -18,18 +21,23 @@
 
 /** @jsxImportSource @opentui/solid */
 
+import { spawn } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
 
 import { Plugin } from "@opencode/plugin/tui"
 
 import {
+  cliBinary,
   loadProfiles,
   profilesRoot,
   readSelection,
+  readSelectionState,
+  startupInfo,
   stateFile,
   writeSelection,
   type Profile,
+  type StartupInfo,
 } from "./profiles.ts"
 
 export default Plugin.define({
@@ -44,12 +52,38 @@ export default Plugin.define({
       initial: { name: readSelection() },
     })
 
+    const [prefs, setPrefs] = context.storage.store<{ askRestart: boolean }>("preferences", {
+      initial: { askRestart: true },
+    })
+
+    // The server's verdict about startup-only keys, echoed through the handoff
+    // file — only the server process knows its own OPENCODE_CONFIG.
+    const restored = readSelectionState()
+    const [startup, setStartup] = context.storage.memory<StartupInfo & { profile: string | null }>("startup", {
+      initial: {
+        profile: restored.profile,
+        kind: restored.startup?.kind ?? "none",
+        keys: restored.startup?.keys ?? [],
+        command: restored.startup?.command,
+      },
+    })
+
     const remember = (name: string | null) => {
       if (applied.name === name) return
       void setApplied((draft) => {
         draft.name = name
       }).catch(() => {
         // Durable write failed (disk/full); the file watcher still refreshes.
+      })
+    }
+
+    const syncStartup = () => {
+      const state = readSelectionState()
+      setStartup((draft) => {
+        draft.profile = state.profile
+        draft.kind = state.startup?.kind ?? "none"
+        draft.keys = state.startup?.keys ?? []
+        draft.command = state.startup?.command
       })
     }
 
@@ -90,6 +124,8 @@ export default Plugin.define({
       cache = { at: 0, items: [] }
     }
 
+    const activeProfile = () => profiles().find((profile) => profile.name === applied.name)
+
     // The TUI keeps its own per-location cache of agents / models / mcp servers.
     // After the server applies a profile we must invalidate + re-sync those, or
     // the switch only becomes visible after a relaunch.
@@ -109,18 +145,132 @@ export default Plugin.define({
       }
     }
 
+    // --- restart with the profile layered in -------------------------------
+
+    /**
+     * A profile's startup verdict. Without the server's answer only the profile
+     * itself is known, which is enough for "pending": whether a key needs a
+     * restart depends on the profile, not on the process.
+     */
+    const verdictFor = (profile: Profile): StartupInfo =>
+      startup.profile === profile.name && startup.kind !== "none"
+        ? { kind: startup.kind, keys: startup.keys.length ? startup.keys : profile.warnings.relaunch, command: startup.command }
+        : startupInfo(profile.configFile, profile.warnings.relaunch)
+
+    const restartWith = (profile: Profile) => {
+      const info = startupInfo(profile.configFile, profile.warnings.relaunch)
+      try {
+        spawn(cliBinary(), ["service", "restart"], {
+          env: { ...process.env, OPENCODE_CONFIG: profile.configFile },
+          detached: true,
+          stdio: "ignore",
+        }).unref()
+        setStartup((draft) => {
+          draft.kind = "layered"
+          draft.profile = profile.name
+        })
+        context.ui.toast.show({
+          title: "Profile",
+          message: `restarting the service with ${profile.name} layered in — relaunch opencode if the terminal does not reconnect`,
+          variant: "info",
+          duration: 6000,
+        })
+      } catch (error) {
+        console.warn("[profile-switcher] restart failed", error)
+        context.ui.toast.show({
+          title: "Profile",
+          message: `could not restart the service — run: ${info.command ?? "opencode service restart"}`,
+          variant: "error",
+          duration: 8000,
+        })
+      }
+    }
+
+    /**
+     * Wait for the server to echo its verdict into the handoff file. The server
+     * writes `startup`, the TUI's own write does not, so its presence means the
+     * server has caught up with this switch.
+     */
+    const waitForVerdict = async (name: string, profile: Profile, timeoutMs = 1500): Promise<StartupInfo> => {
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        const state = readSelectionState()
+        if (state.profile === name && state.startup) {
+          syncStartup()
+          return state.startup
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120))
+      }
+      return startupInfo(profile.configFile, profile.warnings.relaunch)
+    }
+
+    const offerRestart = async (profile: Profile) => {
+      const info = await waitForVerdict(profile.name, profile)
+      if (info.kind === "layered") {
+        context.ui.toast.show({
+          title: "Profile",
+          message: `${profile.name} applied — startup keys already loaded (${info.keys.join(", ")})`,
+          variant: "success",
+          duration: 3000,
+        })
+        return
+      }
+      if (info.kind !== "pending" || !info.command) return
+
+      if (!prefs.askRestart) {
+        context.ui.toast.show({
+          title: "Profile",
+          message: `⟳ ${info.keys.join(", ")} need a restart — ${info.command}`,
+          variant: "warning",
+          duration: 7000,
+        })
+        return
+      }
+
+      let confirmed = false
+      try {
+        confirmed = (await context.ui.dialog.confirm({
+          title: "Restart the service?",
+          message:
+            `${profile.name} sets ${info.keys.join(", ")} — those keys are read when the server ` +
+            "starts, so they are not applied yet.\n\n" +
+            "Restart now with this profile layered in?\n" +
+            `OPENCODE_CONFIG=${profile.configFile}\n\n` +
+            "Sessions keep their history. Anything running in this one is interrupted.",
+          label: { confirm: "Restart service", cancel: "Not now" },
+        })) === true
+      } catch (error) {
+        console.warn("[profile-switcher] could not show the restart dialog", error)
+        return
+      }
+
+      if (confirmed) {
+        restartWith(profile)
+        return
+      }
+      context.ui.toast.show({
+        title: "Profile",
+        message: `not now — run \`${info.command}\`, or use "Restart service" in the palette`,
+        variant: "info",
+        duration: 6000,
+      })
+    }
+
     const notify = (name: string | null) => {
       const target = name ? profiles().find((profile) => profile.name === name) : undefined
       const dropped = target ? target.warnings.legacy.length + target.warnings.unknown.length : 0
+      const pending = target && target.warnings.relaunch.length > 0
       try {
         context.ui.toast.show({
           title: "Profile",
           message: target
             ? dropped
               ? `${target.name} applied — ⚠ ${dropped} field${dropped === 1 ? "" : "s"} ignored`
-              : `${target.name} applied`
+              : pending
+                ? `${target.name} applied — ⟳ ${target.warnings.relaunch.length} keys need a restart`
+                : `${target.name} applied`
             : "profile removed",
-          variant: dropped ? "warning" : "success",
+          variant: dropped ? "warning" : pending ? "warning" : "success",
           duration: 3000,
         })
       } catch (error) {
@@ -134,6 +284,11 @@ export default Plugin.define({
       writeSelection(name, sessionID)
       remember(name)
       invalidateProfiles()
+      setStartup((draft) => {
+        draft.profile = name
+        draft.kind = "none"
+        draft.keys = []
+      })
       // Give the server's watcher a beat to apply, then refresh the TUI's
       // per-location caches so the switch is visible without a relaunch.
       setTimeout(reflect, 300)
@@ -153,6 +308,8 @@ export default Plugin.define({
         setTimeout(resync, 2000)
       }
       notify(name)
+      const target = name ? profiles().find((profile) => profile.name === name) : undefined
+      if (target) void offerRestart(target)
     }
 
     const detail = (profile: Profile) => {
@@ -162,7 +319,9 @@ export default Plugin.define({
       if (w.unknown.length) notes.push(`⚠ ${w.unknown.length} unrecognized`)
       if (w.adapted.length) notes.push(`${w.adapted.length} V1 key${w.adapted.length === 1 ? "" : "s"} normalized`)
       if (profile.agents.length) notes.push(`${profile.agents.length} agents`)
-      if (w.relaunch.length) notes.push(`relaunch for: ${w.relaunch.join(", ")}`)
+      const info = verdictFor(profile)
+      if (info.kind === "pending") notes.push(`⟳ restart for: ${info.keys.join(", ")}`)
+      if (info.kind === "layered") notes.push(`✓ startup loaded: ${info.keys.join(", ")}`)
       return notes.length ? `${profile.description} · ${notes.join(" · ")}` : profile.description
     }
 
@@ -173,7 +332,7 @@ export default Plugin.define({
         // The ⚠ lives in the title because descriptions are muted/truncated in
         // narrow terminals; the title is always rendered.
         const dropped = profile.warnings.legacy.length + profile.warnings.unknown.length
-        const flag = dropped ? "⚠ " : ""
+        const flag = dropped ? "⚠ " : verdictFor(profile).kind === "layered" ? "✓ " : ""
         return {
           title: profile.name === current ? `active  ${flag}${profile.label}` : `        ${flag}${profile.label}`,
           value: profile.name,
@@ -205,12 +364,11 @@ export default Plugin.define({
     }
 
     // --- badge + keymap ---------------------------------------------------
-    // keymap.layer() is owned by the calling Solid component, so it is
-    // registered from the slot render body (as the session.panel docs do).
+    // keymap.layer() is registered from a component body rather than from
+    // `setup()` (see AGENTS.md): it resolves the Keymap provider through the
+    // current Solid owner tree, which only exists during a component render.
     // NOTE: usePlugin() is NOT used here — the host does not wrap slot renders
-    // in a PluginContextProvider ("PluginContextProvider is missing"). The
-    // setup-closure `context` is the same object; ownership comes from the
-    // component invocation, not from how the context is obtained.
+    // in a PluginContextProvider ("PluginContextProvider is missing").
 
     function Badge() {
       context.keymap.layer(() => ({
@@ -227,11 +385,50 @@ export default Plugin.define({
             suggested: true,
             run: () => void openPicker(),
           },
+          {
+            id: "profile-switcher.restart",
+            title: "Restart service with profile",
+            description: "Bounce the shared server with this profile layered in (OPENCODE_CONFIG)",
+            group: "Profile",
+            bind: false,
+            palette: true,
+            enabled: () => {
+              const target = activeProfile()
+              return target !== undefined && verdictFor(target).kind === "pending"
+            },
+            run: () => {
+              const target = activeProfile()
+              if (target) restartWith(target)
+            },
+          },
+          {
+            id: "profile-switcher.toggle-prompt",
+            title: prefs.askRestart ? "Profile restart prompt: ask" : "Profile restart prompt: label only",
+            description: "Switch between a confirmation dialog and just marking profiles that need a restart",
+            group: "Profile",
+            bind: false,
+            palette: true,
+            run: () => {
+              const next = !prefs.askRestart
+              setPrefs((draft) => {
+                draft.askRestart = next
+              })
+              context.ui.toast.show({
+                title: "Profile",
+                message: next
+                  ? "will ask before restarting the service"
+                  : "will only mark profiles that need a restart — restart from the palette",
+                variant: "info",
+                duration: 3000,
+              })
+            },
+          },
         ],
-        bindings: ["profile-switcher.pick"],
+        bindings: ["profile-switcher.pick", "profile-switcher.restart", "profile-switcher.toggle-prompt"],
       }))
-      // Reactive store read — re-renders when remember() updates the name.
-      return <text>{applied.name ?? ""}</text>
+      // Reactive store reads — re-renders when remember()/setStartup() change.
+      const mark = startup.profile === applied.name ? (startup.kind === "pending" ? " ⟳" : startup.kind === "layered" ? " ✓" : "") : ""
+      return <text>{`${applied.name ?? ""}${mark}`}</text>
     }
 
     const removeSlot = context.ui.slot({
@@ -249,8 +446,11 @@ export default Plugin.define({
     const unwatch = watchFile(file, () => {
       remember(readSelection())
       invalidateProfiles()
+      syncStartup()
       setTimeout(reflect, 300)
     })
+
+    syncStartup()
 
     return () => {
       removeSlot()

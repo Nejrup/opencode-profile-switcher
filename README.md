@@ -7,24 +7,35 @@ with different agents, a locked-down one for production repos — and flip betwe
 them with `<leader>p` while a session is running.
 
 ```text
-schematic — picker and footer badge, not a screenshot
+schematic — picker, restart prompt and footer badge, not a screenshot
 
-  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
    Profile
   ─────────────────────────────────────────────────
-    active  base config        No profile overlay
-            fast               gpt-5-nano route · ⚠ 2 legacy fields ignored
-            review-only        edit denied · 3 agents
-    ▸       deep               architect + explorer · relaunch for: compaction
+    active  base config          No profile overlay
+            fast                 gpt-5-nano route · ⚠ 2 legacy fields ignored
+    ▸       deep  ⟳              architect + explorer · ⟨ restart for: plugins ⟩
+            review-only ✓        edit denied · ✓ startup loaded
   ─────────────────────────────────────────────────
-   build · deep · 128k/32k ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
-                                  footer: ▔▔▔ deep ▔▔▔
+
+  ┌ Restart the service? ─────────────────────────┐
+  │ deep sets plugins, compaction — those keys    │
+  │ are read when the server starts.              │
+  │                                              │
+  │ OPENCODE_CONFIG=…/profiles/deep/opencode.jsonc│
+  │ Sessions keep their history; a running turn   │
+  │ is interrupted.                               │
+  │                     ⟨ Restart service ⟩  Not now
+  └───────────────────────────────────────────────┘
+
+   build · deep ⟳ · 128k/32k
 ```
 
 | | |
 | --- | --- |
 | **Applies live** | default agent, per-agent models, agent `.md` definitions, default model, MCP servers, permission rules, named references, websearch provider, per-agent generation tuning |
-| **Reports** | which fields need a relaunch, which are V1-but-normalized, which V2 ignores — each with the fix |
+| **Marks & offers** | `⟳ needs restart` on profiles whose keys are startup-bound, and a one-keystroke restart that applies them for real |
+| **Reports** | which fields are V1-but-normalized, which V2 ignores — each with the fix |
 | **Writes** | nothing in your config; only the picker's own handoff file |
 
 OpenCode **2.x** only (V1 has no plugin API for this). MIT licensed.
@@ -36,6 +47,7 @@ OpenCode **2.x** only (V1 has no plugin API for this). MIT licensed.
 - [Make a profile](#make-a-profile)
 - [Use](#use)
 - [What changes take effect](#what-changes-take-effect)
+  - [When a profile needs a restart](#when-a-profile-needs-a-restart)
 - [It tells you when a profile is stale](#it-tells-you-when-a-profile-is-stale)
 - [Troubleshooting](#troubleshooting)
 - [Known limits](#known-limits)
@@ -146,11 +158,12 @@ Three profiles worth starting with:
 | How | What |
 | --- | --- |
 | `<leader>p` | Picker (`ctrl+x` then `p` by default) |
-| Command palette | "Switch profile" |
+| Command palette | "Switch profile", "Restart service with profile", "Profile restart prompt: …" |
 | `/profile` | Applied profile, plus the full list |
 | `/profile <name>` | Apply a profile — matches name or label, case-insensitive |
 | `/profile none` | Back to base config |
 | `/profile prev` | Back to the previously applied profile |
+| `/profile restart` | Print the exact command that applies this profile's startup keys |
 
 The footer shows the active profile name and is blank on base config. The choice
 is persisted to `<config>/.profile-switcher.json`, so it survives restarts, and
@@ -185,34 +198,65 @@ Two deliberate choices behind the table:
   session onto the profile's default agent and model, and the terminal's own
   caches are re-synced so it's visible without a relaunch.
 
-<details>
-<summary><b>Keys that need a restart instead</b> (the picker and <code>/profile</code> name them per profile)</summary>
+### When a profile needs a restart
 
-Some settings are read once when a server starts and have no runtime transform in
-this plugin: `plugins`, `experimental`, `compaction`, `providers`, `lsp`,
+About twenty V2 keys are read once when a server starts and have **no runtime
+transform**: `plugins`, `experimental`, `compaction`, `providers`, `lsp`,
 `formatter`, `instructions`, `skills`, `commands`, `watcher`, `media`,
-`tool_output`, `snapshots`, `worktree`, `warming`, `update`, `share`, `enterprise`,
-`username`, `shell`.
+`tool_output`, `snapshots`, `worktree`, `warming`, `update`, `share`,
+`enterprise`, `username`, `shell`.
 
-A profile is **not** a launch target — `opencode <dir>` opens a *project* — so
-running with those values means making them part of a config a starting server
-actually reads:
+A profile directory is not a launch target — `opencode <dir>` opens a *project* —
+but a starting server does read one extra config document from
+`OPENCODE_CONFIG`, merged **above** your global config. So the plugin restarts
+the service *with the profile layered in*, which applies those keys for real:
+
+- the picker, the footer badge and `/profile` mark such profiles
+  **`⟳ needs restart (2)`**
+- right after you apply one, a dialog asks: **Restart the service?** — confirming
+  runs `opencode service restart` with `OPENCODE_CONFIG=<profile>/opencode.jsonc`
+- the marker then reads **`✓ startup loaded`**, and `/profile` says so too
+- not a popup person? Palette → **"Profile restart prompt: label only"** keeps
+  the marker and drops the dialog; the toast then prints the command instead
+- at any time: palette → **"Restart service with profile"** (enabled only while
+  something is pending), or `/profile restart` to copy the command yourself
+
+What a restart costs you:
+
+- sessions, messages and history live in the database — they survive
+- **a running turn is interrupted**, so let long work finish first
+- if the terminal doesn't reconnect on its own, relaunch `opencode`
+- only the restarted service carries the layered config; other `opencode`
+  commands you run yourself need the variable set explicitly
+
+Prefer one project permanently pinned to a profile? Let the project carry it:
 
 ```sh
-# per project: let the project carry the profile
 ln -s ~/.config/opencode/profiles/deep/opencode.jsonc ~/work/repo/opencode.jsonc
-opencode ~/work/repo
-
-# everywhere else: fold those keys into <config>/opencode.jsonc, then
-opencode service restart
 ```
 
-Everything else in that profile still switches live; only these keys are
-startup-bound. `commands` and `providers` do have plugin transforms, but slash
-command template rendering and provider connection lifecycle belong to core — a
-profile overlay guessing at them would be worse than telling you to restart.
+<details>
+<summary>How a layered profile merges with your existing config</summary>
+
+The profile becomes the highest-precedence config document, so:
+
+- keys it doesn't mention are kept from your global and project config
+- conflicting scalars and objects take the profile's value
+- `plugins` arrays from applicable config files are applied from lowest to
+  highest **instead of replacing one another** — a profile can add a plugin
+  without repeating the global list
+- `permissions` **replaces** the effective array
+- `commands` and `providers` land properly here, which the live path cannot do:
+  slash-command template rendering and provider connection lifecycle belong to
+  core, so faking them from an overlay would be worse than a restart
+
+One caveat: as a config document the profile is normalized by OpenCode itself, so
+V1 keys still work there — but this plugin's transforms and its switch-time lint
+read native V2 shapes only. Keep profiles native, or a layered restart and the
+live view will disagree about what is active.
 
 </details>
+
 
 ## It tells you when a profile is stale
 
@@ -260,7 +304,11 @@ rather than guessing at a translation.
 | `/plugins` shows a failure marker on it | resolved a bad copy, or you edited a local install | `opencode plugin update`; if it sticks, `rm -rf ~/.cache/opencode/npm/git-*profile-switcher-*` and re-add |
 | Applied a profile but agents/models did not change | profile uses V1 `agent:` / `permission:` keys | rename to `agents` / `permissions` — the switch report lists exactly which |
 | Agents appear with no prompt | `agents/<name>.md` missing or unreadable | add the file; the picker counts how many agents were loaded |
-| Profile changes a `plugins` or `compaction` key and nothing happens | those are read at startup | put them in the config the server reads when it starts — the project's `opencode.jsonc` or `<config>/opencode.jsonc` — then `opencode service restart` |
+| Profile sets `plugins` / `compaction` and nothing moves | those are read at server start | apply the profile and confirm the restart prompt, or palette → "Restart service with profile" |
+| `⟳ needs restart` will not become `✓ startup loaded` | the service was started without the layered config | restart from the picker (it sets `OPENCODE_CONFIG`), or run the command `/profile restart` prints |
+| Restart prompt never appears | it is set to label-only | palette → "Profile restart prompt: ask" |
+| Terminal stops responding after a restart | the client did not rediscover the service | relaunch `opencode` — sessions and history are on disk |
+| `could not restart the service` toast | the CLI is not the running binary (wrapper, `bun`, a shim) | set `OPENCODE_BIN` to the real `opencode` executable |
 | Two OpenCode windows disagree | the handoff file is global, one switch wakes every loaded location | intentional today; see [Limits](#known-limits) |
 
 ## Known limits
@@ -268,10 +316,13 @@ rather than guessing at a translation.
 - **The overlay is global, not per-location.** The handoff file is one file in the
   config dir, so a switch applies to every location the service has loaded; only
   session migration is ownership-checked.
-- **Twenty keys can't be swapped live** (`plugins`, `compaction`, `providers`,
-  `experimental`, …). They are read when a server starts, and a profile directory
-  is not a launch target — `opencode <dir>` opens a *project*. See
-  [What changes take effect](#what-changes-take-effect) for the two real recipes.
+- **Twenty keys are startup-bound.** No plugin can change them inside a running
+  server, so this one bounces the service with the profile layered in — which
+  does apply them, at the cost of interrupting the running turn. Details in
+  [When a profile needs a restart](#when-a-profile-needs-a-restart).
+- **The layered config lives in the service's environment.** Other `opencode`
+  commands you start yourself (a `--standalone` run, a script) do not inherit
+  it; they read the same profile only if you pass `OPENCODE_CONFIG` too.
 - **A profile can tighten permissions but never loosen them.** The `evaluate` hook
   runs after the configured ruleset, and an explicit configured `deny` is final.
 - **Resource semantics belong to core.** Rules match `action` and `resource` globs
@@ -285,7 +336,7 @@ rather than guessing at a translation.
 ```sh
 bun install
 bun run typecheck   # tsc --noEmit against the real @opencode/plugin 2.x types
-bun test            # 29 tests: refs, permission precedence, field lint, references, frontmatter
+bun test            # 37 tests: refs, permission precedence, field lint, references, startup, frontmatter
 ```
 
 Iterate without pushing: `./install.sh` registers this checkout with

@@ -3,11 +3,14 @@ import { describe, expect, test } from "bun:test"
 import {
   agentMode,
   classifyConfig,
+  cliBinary,
   mcpServers,
   parseAgentMarkdown,
   parseModelRef,
   referenceSources,
   resolveEffect,
+  startupInfo,
+  startupLabel,
   toPermissionRules,
   websearchSelection,
 } from "../src/profiles.ts"
@@ -294,6 +297,58 @@ describe("websearchSelection", () => {
     expect(websearchSelection({ websearch: { provider: "" } })).toBeUndefined()
     expect(websearchSelection({ websearch: "exa" })).toBeUndefined()
     expect(websearchSelection({})).toBeUndefined()
+  })
+})
+
+describe("startupInfo", () => {
+  const config = "/home/you/.config/opencode/profiles/deep/opencode.jsonc"
+
+  test("a profile with no startup-only keys needs nothing", () => {
+    expect(startupInfo(config, [])).toEqual({ kind: "none", keys: [] })
+  })
+
+  test("pending startup keys carry the exact restart command", () => {
+    const info = startupInfo(config, ["plugins", "compaction"])
+    expect(info.kind).toBe("pending")
+    expect(info.keys).toEqual(["plugins", "compaction"])
+    expect(info.command).toBe(`OPENCODE_CONFIG="${config}" opencode service restart`)
+  })
+
+  test("layered when the server was started with this profile", () => {
+    expect(startupInfo(config, ["plugins"], config).kind).toBe("layered")
+    // same file, spelled differently
+    expect(startupInfo(config, ["plugins"], "/home/you/.config/opencode/profiles/deep/../deep/opencode.jsonc").kind).toBe(
+      "layered",
+    )
+  })
+
+  test("another profile layered in still counts as pending", () => {
+    const info = startupInfo(config, ["plugins"], "/home/you/.config/opencode/profiles/fast/opencode.jsonc")
+    expect(info.kind).toBe("pending")
+  })
+
+  test("an empty env value is not a layered profile", () => {
+    expect(startupInfo(config, ["plugins"], "").kind).toBe("pending")
+  })
+
+  test("startupLabel renders the badge text", () => {
+    expect(startupLabel(startupInfo(config, ["plugins", "lsp"]))).toBe("⟳ needs restart (2)")
+    expect(startupLabel(startupInfo(config, ["plugins"], config))).toBe("✓ startup loaded")
+    expect(startupLabel(startupInfo(config, []))).toBe("")
+  })
+})
+
+describe("cliBinary", () => {
+  test("OPENCODE_BIN wins", () => {
+    expect(cliBinary({ OPENCODE_BIN: "/wrappers/oc" }, "/usr/local/bin/opencode")).toBe("/wrappers/oc")
+    expect(cliBinary({ OPENCODE_BIN: "   " }, "/usr/local/bin/opencode")).toBe("/usr/local/bin/opencode")
+  })
+
+  test("uses the running binary when it is the opencode CLI, else PATH", () => {
+    expect(cliBinary({}, "/Users/you/.local/bin/opencode")).toBe("/Users/you/.local/bin/opencode")
+    expect(cliBinary({}, "/opt/opencode/opencode.exe")).toBe("/opt/opencode/opencode.exe")
+    expect(cliBinary({}, "/usr/local/bin/bun")).toBe("opencode")
+    expect(cliBinary({}, "/usr/local/bin/node")).toBe("opencode")
   })
 })
 

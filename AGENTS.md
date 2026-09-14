@@ -100,12 +100,16 @@ currently `agents`, `default_agent`, `model`, `mcp`, `permissions`, `references`
 `websearch`. `reloadAll()` reloads exactly those domains
 (`agent`, `catalog`, `mcp`, `reference`, `websearch`).
 
-Two keys have plugin transforms but are deliberately *not* applied: `commands`
-(slash-command template rendering — `$ARGUMENTS`, `$1`, attachments — is core's,
-and re-implementing it wrong is worse than a restart) and `providers` (a catalog
-transform changes the record, but the integration's connection lifecycle is not
-re-run from it, so a changed `baseURL` may not take effect — half-working is the
-worst outcome). Keep them in `relaunch`.
+Two keys have plugin transforms but are deliberately *not* applied live:
+`commands` (slash-command template rendering — `$ARGUMENTS`, `$1`, attachments —
+is core's, and re-implementing it wrong is worse than a restart) and `providers`
+(a catalog transform changes the record, but the integration's connection
+lifecycle is not re-run from it). Both land correctly through the restart flow,
+because there the profile is read as config by core rather than replayed as a
+transform. Keep them in `relaunch`.
+
+`warnings.relaunch` is also what drives the startup layering UI, so a key that
+moves between buckets changes both the report and whether `⟳` is offered.
 
 The native key set must track the **contract the server serves**, not the
 published schema:
@@ -157,6 +161,60 @@ in a spare terminal.
 
 Log: `~/.local/share/opencode/log/opencode.log`, filter `role=server`; a plugin
 that fails to load logs `failed to load plugin` with the module error.
+
+## Startup layering (the restart flow)
+
+V2 has no "apply config at runtime" API, but the server *does* read one extra
+config document at startup. From the binary's server bootstrap:
+
+```js
+config: {
+  directory: process.env.OPENCODE_CONFIG_DIR,   // replaces the global config dir
+  project:   !enabled(OPENCODE_CONFIG_PROJECT_DISABLE ?? OPENCODE_DISABLE_PROJECT_CONFIG),
+  file:      process.env.OPENCODE_CONFIG,       // one extra config file
+  content:   process.env.OPENCODE_CONFIG_CONTENT,
+}
+```
+
+**None of these are in the V2 docs** — they are read off the binary, so re-probe
+them after an upgrade (recipe below). Verified behaviour on 2.0.3: with
+`OPENCODE_CONFIG=<profile>/opencode.jsonc` the profile appears in `/api/config`
+as the **last** document, above `<config>/opencode.jsonc` and the directory
+sources, so its keys win and its `plugins` / `providers` / `compaction` are real.
+
+The handoff file carries the verdict, because only the **server** process knows
+its own environment:
+
+- the server's `apply()` writes `startup: { kind, keys, command }` alongside
+  `{ profile, at, sessionID }` (`startupInfo()` in `src/profiles.ts`)
+- the TUI's own write has no `startup` key — that asymmetry is how
+  `waitForVerdict()` knows the server has caught up; it polls ~1.5 s, then falls
+  back to a client-side estimate (`relaunch.length > 0` ⇒ `pending`, which is
+  correct because needing a restart depends on the profile, not the process)
+- `context.storage.memory` holds that verdict for the badge and dialog (ephemeral
+  by design); `context.storage.store` holds the durable profile name and the
+  `askRestart` preference
+- restart: `spawn(cliBinary(), ["service", "restart"], { env: { ...process.env,
+  OPENCODE_CONFIG: profile.configFile }, detached: true, stdio: "ignore" })`.
+  `service restart` in turn spawns the daemon with `{ ...process.env, ...extra }`,
+  which is why setting the variable on the spawn is enough.
+- `cliBinary()` prefers `process.execPath` when its basename starts with
+  `opencode`, else falls back to `opencode` on `PATH`; `OPENCODE_BIN` overrides
+  for wrappers. Keep it in `src/profiles.ts` — it is env/path logic and testable.
+
+**Never test the restart from inside the service you are running in** — it
+terminates your own session. Verify with a private server instead, which does not
+touch the managed service:
+
+```sh
+OPENCODE_CONFIG=$HOME/.config/opencode/profiles/deep/opencode.jsonc \
+  opencode serve --port 40098 --print-logs > /tmp/serve.log 2>&1 &
+sleep 6                       # then take "server password …" from /tmp/serve.log
+curl -s -u "opencode:$PASS" http://127.0.0.1:40098/api/config \
+  | jq -r '.[] | select(.type=="document") | .path'
+```
+
+The profile path must be listed, and last. Kill that process when you are done.
 
 ## House rules
 
