@@ -1,0 +1,29 @@
+{
+  "name": "opencode-profile-switcher",
+  "version": "1.0.0",
+  "description": "Switch OpenCode config profiles live from the TUI — no config edits, no restart",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": ["src"],
+  "keywords": ["opencode", "opencode-plugin", "profile", "config", "tui"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nejrup/opencode-profile-switcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Nejrup/opencode-profile-switcher/issues"
+  },
+  "homepage": "https://github.com/Nejrup/opencode-profile-switcher#readme",
+  "dependencies": {
+    "@opencode/plugin": "^2.0.3"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
+  }
+}
